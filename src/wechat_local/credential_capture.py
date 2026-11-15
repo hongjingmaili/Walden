@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
-from .live_catalog import LiveCatalogError, discover_numeric_shards
+from .source_catalog import LiveCatalogError, discover_numeric_shards
 from .live_readonly import open_encrypted_readonly
 
 

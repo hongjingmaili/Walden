@@ -245,7 +245,7 @@ def reply_cli_main(argv: list[str] | None = None, *, runner: Callable[..., Any] 
     Pending state stores hashes only; the body is provided again at confirmation
     and must match the displayed preparation exactly.
     """
-    parser = argparse.ArgumentParser(description="Prepare or confirm one local reply")
+    parser = argparse.ArgumentParser(description="Optional existing-evidence reply compatibility: prepare or confirm one local reply. Requires configured pre-existing source_event_ids and materializations; fresh native init/refresh does not produce them. Native source references are not reply evidence.")
     subparsers = parser.add_subparsers(dest="action", required=True)
     prepare = subparsers.add_parser("prepare")
     confirm = subparsers.add_parser("confirm")

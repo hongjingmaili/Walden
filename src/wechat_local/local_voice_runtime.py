@@ -130,7 +130,38 @@ class LocalWhisperTranscriber:
             raise LocalVoiceRuntimeError("decoder_unavailable")
         return selected
 
-    def transcribe(self, payload: bytes) -> LocalTranscription:
+    def decode_audio(self, payload: bytes) -> bytes:
+        """Produce local playable WAV using pilk only; ASR/model absence cannot block playback."""
+        import io
+        if type(payload) is not bytes or not payload or len(payload)>MAX_VOICE_BYTES:
+            raise LocalVoiceRuntimeError('audio_payload_unavailable')
+        if not (payload.startswith(b'#!SILK_V3') or payload[1:].startswith(b'#!SILK_V3')):
+            raise LocalVoiceRuntimeError('audio_format_unsupported')
+        root=self.runtime_root_input
+        if root.is_symlink() or not root.is_dir():raise LocalVoiceRuntimeError('runtime_unavailable')
+        root=root.resolve();pilk=root/'python'
+        if pilk.is_symlink() or not (pilk/'pilk').is_dir():raise LocalVoiceRuntimeError('decoder_unavailable')
+        python=self._external_python(self.python_executable_input)
+        with tempfile.TemporaryDirectory(prefix='voice-decode-',dir=root) as temporary:
+            run=Path(temporary).resolve()
+            if not run.is_relative_to(root):raise LocalVoiceRuntimeError('decoder_unavailable')
+            source=run/'source.silk';pcm=run/'source.pcm';source.write_bytes(payload);source.chmod(0o600)
+            code='import sys;sys.path.insert(0,sys.argv[1]);import pilk;pilk.decode(sys.argv[2],sys.argv[3],pcm_rate=24000)'
+            try:
+                subprocess.run([str(python),'-I','-c',code,str(pilk),str(source),str(pcm)],
+                    env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin'},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=30)
+                if pcm.is_symlink() or not 0<pcm.stat().st_size<=64*1024*1024:raise LocalVoiceRuntimeError('decode_unavailable')
+                data=pcm.read_bytes()
+                if len(data)%2:raise LocalVoiceRuntimeError('decode_unavailable')
+                out=io.BytesIO()
+                with wave.open(out,'wb') as audio:audio.setparams((1,2,24000,0,'NONE','NONE'));audio.writeframes(data)
+                return out.getvalue()
+            except (OSError,subprocess.SubprocessError,wave.Error) as exc:raise LocalVoiceRuntimeError('decode_unavailable') from exc
+
+    def transcribe_wav(self, payload: bytes, wav_payload: bytes) -> LocalTranscription:
+        return self.transcribe(payload,wav_payload=wav_payload)
+
+    def transcribe(self, payload: bytes, *, wav_payload: bytes | None = None) -> LocalTranscription:
         if not isinstance(payload, bytes) or not payload or len(payload) > MAX_VOICE_BYTES:
             raise LocalVoiceRuntimeError("audio_payload_unavailable")
         if not (
@@ -154,37 +185,46 @@ class LocalWhisperTranscriber:
             transcript_path = run_dir / "transcript.txt"
             silk_path.write_bytes(payload)
             os.chmod(silk_path, 0o600)
-            decoder_code = (
-                "import sys; sys.path.insert(0, sys.argv[1]); "
-                "import pilk; pilk.decode(sys.argv[2], sys.argv[3], pcm_rate=24000)"
-            )
-            environment = {
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            }
-            subprocess.run(
-                [
-                    str(self.python_executable),
-                    "-I",
-                    "-c",
-                    decoder_code,
-                    str(self.pilk_root),
-                    str(silk_path),
-                    str(pcm_path),
-                ],
-                env=environment,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-                timeout=TRANSCRIPTION_TIMEOUT_SECONDS,
-            )
-            pcm = pcm_path.read_bytes()
-            if not pcm or len(pcm) % 2:
-                raise LocalVoiceRuntimeError("decode_unavailable")
-            with wave.open(str(wav_path), "wb") as output:
-                output.setparams((1, 2, 24000, 0, "NONE", "NONE"))
-                output.writeframes(pcm)
-            for path in (pcm_path, wav_path):
-                os.chmod(path, 0o600)
+            if wav_payload is not None:
+                import io
+                try:
+                    if type(wav_payload) is not bytes or len(wav_payload)>64*1024*1024+4096:raise ValueError()
+                    with wave.open(io.BytesIO(wav_payload),'rb') as prepared:
+                        if prepared.getnchannels()!=1 or prepared.getsampwidth()!=2 or prepared.getframerate()!=24000:raise ValueError()
+                    wav_path.write_bytes(wav_payload);wav_path.chmod(0o600)
+                except (ValueError,wave.Error,EOFError) as exc:raise LocalVoiceRuntimeError('decode_unavailable') from exc
+            else:
+                decoder_code = (
+                    "import sys; sys.path.insert(0, sys.argv[1]); "
+                    "import pilk; pilk.decode(sys.argv[2], sys.argv[3], pcm_rate=24000)"
+                )
+                environment = {
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                }
+                subprocess.run(
+                    [
+                        str(self.python_executable),
+                        "-I",
+                        "-c",
+                        decoder_code,
+                        str(self.pilk_root),
+                        str(silk_path),
+                        str(pcm_path),
+                    ],
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=TRANSCRIPTION_TIMEOUT_SECONDS,
+                )
+                pcm = pcm_path.read_bytes()
+                if not pcm or len(pcm) % 2:
+                    raise LocalVoiceRuntimeError("decode_unavailable")
+                with wave.open(str(wav_path), "wb") as output:
+                    output.setparams((1, 2, 24000, 0, "NONE", "NONE"))
+                    output.writeframes(pcm)
+                for path in (pcm_path, wav_path):
+                    os.chmod(path, 0o600)
             whisper_environment = {
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "DYLD_LIBRARY_PATH": str(self.whisper.parent),

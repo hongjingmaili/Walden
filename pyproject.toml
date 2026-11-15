@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechat-local-readonly"
-version = "0.4.1"
+version = "0.7.9"
 license = {text = "Apache-2.0"}
 description = "Read-only, bounded local WeChat message queries for macOS"
 readme = "README.md"
@@ -18,9 +18,11 @@ dependencies = [
 images = ["Pillow==11.3.0", "cryptography==45.0.6"]
 
 [project.scripts]
-wechat-local-window = "wechat_local.codex_first_runtime:main"
+wechat-local-evidence = "wechat_local.failure_evidence:main"
 wechat-local-reply = "wechat_local.reply_workflow:reply_cli_main"
 wechat-local-setup = "wechat_local.source_setup:main"
+wechat-local-sync = "wechat_local.native_mirror_cli:console_main"
+wechat-local-window = "wechat_local.native_window:console_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

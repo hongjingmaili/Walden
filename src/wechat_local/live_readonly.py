@@ -24,8 +24,17 @@ from .wcdb_crypto import (
 )
 
 
+def _owned_deadline():
+    # Lazy import keeps foreground source setup independent of mirror imports.
+    from .native_deadline import check_deadline
+    check_deadline()
+
+
 class LiveReadonlyError(RuntimeError):
     """Raised when a live database cannot be safely opened read-only."""
+
+class SourceKeyVerificationError(LiveReadonlyError):
+    """The supplied key failed the existing encrypted page verification."""
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,7 @@ def read_private_passphrase(path: Path) -> bytes:
         raise LiveReadonlyError(
             "Passphrase file must not be accessible by group or other users"
         )
+    _owned_deadline()
     material = resolved.read_bytes()
     if len(material) != KEY_SIZE:
         raise LiveReadonlyError("Passphrase material must be exactly 32 bytes")
@@ -126,6 +136,7 @@ def derive_verified_database_material(
     resolved = path.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(resolved)
+    _owned_deadline()
     with resolved.open("rb") as handle:
         page_one = handle.read(PAGE_SIZE)
     if len(page_one) != PAGE_SIZE:
@@ -133,7 +144,7 @@ def derive_verified_database_material(
     salt = page_one[:SALT_SIZE]
     key = derive_database_key(passphrase, salt)
     if not verify_encryption_key(key, page_one):
-        raise LiveReadonlyError(f"HMAC verification failed: {resolved.name}")
+        raise SourceKeyVerificationError("Encrypted database key verification failed")
     return key, salt
 
 
@@ -162,34 +173,48 @@ def open_encrypted_readonly(
         raise ValueError("busy_timeout_ms must not be negative")
 
     resolved = path.resolve()
+    _owned_deadline()
     key, salt = derive_verified_database_material(resolved, passphrase)
+    _owned_deadline()
     sqlcipher = sqlcipher_module or _sqlcipher_module()
-    failures: list[str] = []
+    failures: list[Exception] = []
 
     for material in (key, key + salt):
+        _owned_deadline()
         options = {'check_same_thread': False} if _thread_handoff else {}
-        conn = sqlcipher.connect(
-            readonly_database_uri(resolved), uri=True, timeout=timeout_seconds, **options
-        )
         try:
+            conn = sqlcipher.connect(
+                readonly_database_uri(resolved), uri=True, timeout=timeout_seconds, **options
+            )
+        except Exception as exc:
+            raise LiveReadonlyError("SQLCipher source open failed") from exc
+        try:
+            _owned_deadline()
             conn.execute(_key_pragma(material))
+            _owned_deadline()
             conn.execute("PRAGMA cipher_compatibility = 4")
+            _owned_deadline()
             conn.execute("PRAGMA query_only = ON")
+            _owned_deadline()
             conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+            _owned_deadline()
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            _owned_deadline()
             query_only_row = conn.execute("PRAGMA query_only").fetchone()
             if not query_only_row or int(query_only_row[0]) != 1:
                 raise LiveReadonlyError("SQLite query_only could not be enabled")
             return conn, len(material)
         except Exception as exc:
-            failures.append(type(exc).__name__)
-            conn.close()
+            failures.append(exc)
+            try:conn.close()
+            except Exception as cleanup:failures.append(cleanup)
+            if isinstance(exc,PermissionError) or getattr(exc,'errno',None) in (1,13) or (type(getattr(exc,'sqlite_errorcode',None)) is int and exc.sqlite_errorcode & 255 == 3):
+                break
 
-    kinds = ", ".join(failures) if failures else "unknown error"
-    raise LiveReadonlyError(
-        f"SQLCipher could not open verified database read-only: "
-        f"{resolved.name} ({kinds})"
-    )
+    error=LiveReadonlyError("SQLCipher could not open verified database read-only")
+    error.secondary_errors=tuple(failures[1:])
+    if failures:raise error from failures[0]
+    raise error
 
 
 def probe_live_database(
@@ -251,3 +276,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+from .failure_evidence import _register
+_register(_owned_deadline)

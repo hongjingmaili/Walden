@@ -1,92 +1,33 @@
-# 安装与配置指南
+# 安装与配置
 
-[返回 Walden 使用说明](../README.md)
+## 安装
 
-## 1. 准备条件
+需要 macOS 和 Python 3.9 或以上版本。准备一个你有权限使用的微信账号本机数据目录。查询只覆盖当前来源已同步、且副本已复制的内容。
 
-- 一台 Mac、Python 3.9 或以上版本，以及 Codex。
-- 已适配的 x86_64 消息客户端，以及已同步到本机的一个账号数据目录。其他架构、客户端版本和目录布局不保证可用。
-- Apple Command Line Tools，无需安装完整 Xcode。安装命令会处理 Python 依赖；若提示缺少其他系统组件，先按报错补齐。
-
-**已验证客户端版本：4.2.0（构建号270348）**。这不代表其他版本或环境都可用。
-
-Walden 读取本机已有消息，不能补回尚未同步或已经缺失的内容。
-
-## 2. 从源码安装
-
-从 [GitHub](https://github.com/s1y3r9e1w1l222/Walden) 下载并解压源码，或使用已克隆的目录。在终端进入包含 `pyproject.toml` 的源码根目录，运行：
+在新的虚拟环境安装 wheel 或源码。需要配置图片支持时，保留 `[images]` 选项。
 
 ```sh
-DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-APP_HOME="$DATA_HOME/wechat-local"
-VENV="$APP_HOME/venv"
-test ! -e "$VENV" || { echo "Installation exists; keep it and check before updating." >&2; exit 1; }
-mkdir -p "$APP_HOME"
-python3 -m venv "$VENV"
-"$VENV/bin/python" -m pip install ".[images]"
+WALDEN_VENV="${XDG_DATA_HOME:-$HOME/.local/share}/walden/venv"
+python3 -m venv "$WALDEN_VENV"
+"$WALDEN_VENV/bin/python" -m pip install ".[images]"
 ```
 
-这会建立独立安装环境，并安装基础图片支持。安装目录已存在时会停止，请保留现有安装，不要直接删除重建。任何一步报错时，先处理错误再继续。
+上面的源码安装命令在包含 `pyproject.toml` 的目录中运行。wheel 安装可将 `".[images]"` 替换为该 wheel 路径并在路径末尾加 `[images]`。
 
-## 3. 安装查询技能
+将该安装包内 `wechat_local/resources/skills/wechat-local-query/SKILL.md` 复制到工具的用户技能目录。使用 Codex 时可放在 `~/.agents/skills/wechat-local-query/SKILL.md`。已有日常安装和同名 Skill 时请先保留现有副本，再按受支持的升级路径操作。
 
-安装成功后，在终端运行以下命令，将随包技能复制到 Codex 用户目录。已有同名技能时会停止，不覆盖现有内容。
+## 配置和同步
 
-```sh
-SKILL_DIR="$HOME/.agents/skills/wechat-local-query"
-test ! -e "$SKILL_DIR" || { echo "Skill exists; keep it and check before updating." >&2; exit 1; }
-mkdir -p "$SKILL_DIR"
-DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-PYTHON="$DATA_HOME/wechat-local/venv/bin/python"
-"$PYTHON" - <<'PY'
-from importlib.resources import files
-from pathlib import Path
+使用同一环境中的 `wechat-local-setup --help` 查看配置选项。首次配置时通过 `--account-root` 指定确认过的账号目录，通过 `--mirror-username` 指定确认授权的会话稳定标识，可以重复指定。可用 `--timezone` 保存查询时区。配置只创建私有配置，不启动同步。
 
-target = Path.home() / ".agents/skills/wechat-local-query/SKILL.md"
-resource = files("wechat_local").joinpath("resources/skills/wechat-local-query/SKILL.md")
-target.write_bytes(resource.read_bytes())
-target.chmod(0o600)
-print("Skill installed.")
-PY
-```
+已授权复制时，依次调用同一环境的 `wechat-local-sync init --source-config` 和 `wechat-local-sync once --source-config`，两条命令均传入实际配置文件。用 `wechat-local-sync status --source-config` 查看覆盖和进度。有些历史需要多轮才能补齐。
 
-如果 Codex 尚未显示新技能，重启 Codex，再明确使用 `wechat-local-query`。
+自动后台复制需要单独启用。用同一环境的 `wechat-local-sync follow-enable`、`follow-status`、`follow-disable` 管理已配置来源的服务，并给各命令传入同一个 `--source-config`。服务登记成功和来源同步健康是两个状态。切换或回退前先确认原服务及其子任务已经停止。
 
-## 4. 首次配置
+## 查询
 
-在 Codex 中说：
+在同一环境调用 `wechat-local-window`，显式传入 `--source-config`，选择一个会话选项（`--contact-query`、`--group-query` 或 `--conversation-username`）。用 `--latest` 查看本地最新 20 条，可按需指定条数。也可用 `--request` 查询明确的时间范围。
 
-> 帮我配置 Walden 并查询最近一小时消息。
+默认 `--read-mode local` 只读副本。仅在明确授权同步该来源时使用 `--read-mode refresh`。查看结果时，结合 `coverage`、`synced_at`、`freshness` 和 `gaps` 判断覆盖。遇到重名、来源冲突或不可用的媒体，请按结果补足确认或报告限制。
 
-选择本人在这台 Mac 上的**单个账号数据文件夹**，不要选择包含多个账号的上层目录。可以把该文件夹从 Finder 拖入 Codex 聊天框，提供它的路径。若不清楚位置，先请 Codex 协助确认，再由本人选择；不自动猜测账号，也不通过读取消息来判断。
-
-随后按提示确认本人身份。配置开始前，保存工作并正常退出消息客户端程序，无需退出账号；如自动打开的窗口需要登录，请本人完成登录。
-
-首次准备可能需要等待，也可以取消。默认先准备最近三小时的消息，可按需要调整；**这不是查询时间上限**。配置成功后再查询；失败或有项目未就绪时，Codex 应说明具体原因，不将其当作全部成功。
-
-## 5. 日常使用
-
-配置完成后，不用每次重新配置。直接在 Codex 中提出请求，例如：
-
-- 看看最近三小时谁找过我。
-- 总结项目群今天讨论的重点。
-- 列出这段对话里明确提到的待办。
-- 根据这段私聊帮我起草回复，先给我确认。
-
-可以指定其他时间范围或单个会话；较大范围按提示确认。消息分类规则可以手动修改，也可以让 Codex 打开可编辑规则，调整摘要、全文等展示方式，下一次查询生效。
-
-## 常见问题
-
-**图片或语音暂时无法解析？**
-基础图片支持已随上述命令安装。部分图片格式、语音转写仍需额外的本地组件或模型，可让 Codex 按随包说明协助准备。附件未下载、文件损坏或组件未就绪时，会保留原消息并说明情况，不编造识别结果。
-
-**客户端关闭后还能读吗？**
-配置成功后，可以读取已同步到本机的消息；获取后续新消息仍需要客户端完成同步。
-
-**配置失败或没有读到消息怎么办？**
-保留错误提示，让 Codex 说明缺少的条件。空结果不一定表示没有消息；数据覆盖不足会明确提示，出现会话归属冲突时会停止相关结果和回复。不要改用其他工程或来源绕过错误。
-
-**会自动发送回复吗？**
-不会。实际发送还需要可用的发送组件，并由你明确确认接收对象和完整正文。结果无法确认时，不重复发送同一操作。
-
-请勿把个人配置、消息结果或本地数据上传到公开仓库或问题反馈中。
+相关说明：[消息分类规则](WA_MESSAGE_CLASSIFICATION_RULES.md)和[本地语音运行环境](VOICE_RUNTIME.md)。

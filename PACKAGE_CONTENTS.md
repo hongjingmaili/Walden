@@ -1,9 +1,11 @@
-# 包内有什么
+# 发布内容
 
-- Walden 程序及查询、配置、回复入口。
-- 使用说明与安装、配置指南。
-- 默认消息分类规则和查询 Skill。
-- 主项目 Apache License 2.0、第三方声明及随附的第三方许可证。
-- 源码仓库中的合成测试材料。
+wheel 包含 Walden 的 Python 程序、查询 Skill、默认分类规则、语音与配置辅助资源及许可证。提供五个命令入口：
 
-交付材料按不包含用户数据、个人配置、聊天结果、客户端副本、调试工具或语音模型的范围准备。主项目采用 Apache License 2.0，第三方组件遵循各自许可证；源码已在 [GitHub](https://github.com/s1y3r9e1w1l222/Walden) 公开。
+- `wechat-local-setup` 配置已授权的本地来源。
+- `wechat-local-sync` 管理副本同步和后台服务。
+- `wechat-local-window` 查询副本。
+- `wechat-local-reply` 处理需要既存证据的回复兼容操作。
+- `wechat-local-evidence` 查看脱敏故障证据。
+
+仓库另外提供说明、测试和独立的辅助程序。用户配置、客户端数据、凭据、语音模型及私有运行记录不随包分发。

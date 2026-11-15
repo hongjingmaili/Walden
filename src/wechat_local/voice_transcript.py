@@ -14,6 +14,7 @@ import hashlib
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Protocol
 
+from .native_deadline import check_deadline
 from .common import quote_identifier
 
 
@@ -101,6 +102,7 @@ class VoiceMessageBinding:
 
 
 def _require_query_only(connection: Any) -> None:
+    check_deadline()
     row = connection.execute("PRAGMA query_only").fetchone()
     if not row or int(row[0]) != 1:
         raise VoiceTranscriptError("Voice source connection must be query-only")
@@ -125,6 +127,7 @@ def _confirmed_conversation_username(
     except TypeError:  # pragma: no cover - old sqlite wrapper fallback
         connection.create_function("wa_message_table", 1, _message_table)
     try:
+        check_deadline()
         rows = connection.execute(
             """
             SELECT user_name FROM Name2Id
@@ -135,6 +138,7 @@ def _confirmed_conversation_username(
             (table_name,),
         ).fetchall()
     except Exception:
+        check_deadline()
         return None
     if len(rows) != 1 or not isinstance(rows[0][0], str):
         return None
@@ -142,6 +146,7 @@ def _confirmed_conversation_username(
 
 
 def _columns(connection: Any, table_name: str) -> set[str]:
+    check_deadline()
     return {
         str(row[1])
         for row in connection.execute(
@@ -163,6 +168,7 @@ def _packed_info_for_binding(
     }
     if not required.issubset(_columns(connection, binding.table_name)):
         return "unsupported", None
+    check_deadline()
     row = connection.execute(
         f"""
         SELECT server_id, local_type, create_time, real_sender_id,
@@ -283,6 +289,7 @@ def _voice_audio(
     *,
     transcriber: LocalVoiceTranscriber | None,
     source_unavailable: bool = False,
+    _capture_payload: Any = None,
 ) -> tuple[dict[str, Any], LocalTranscription | None]:
     # Uniqueness is established by conversation + server id across every
     # explicitly supplied shard first. local_id/create_time are checked only
@@ -295,6 +302,7 @@ def _voice_audio(
         return _audio_result("unavailable", 0, source_complete=False), None
     source_complete = True
     for connection in connections:
+        check_deadline()
         try:
             _require_query_only(connection)
             if not {
@@ -309,9 +317,11 @@ def _voice_audio(
             if "user_name" not in _columns(connection, "Name2Id"):
                 source_complete = False
                 continue
+            check_deadline()
             epoch = (int(connection.execute('PRAGMA data_version').fetchone()[0]),
                      int(connection.total_changes))
             source_epochs.append((connection, epoch))
+            check_deadline()
             rows = connection.execute(
                 """
                 SELECT voice.rowid, voice.local_id, voice.create_time,
@@ -325,6 +335,7 @@ def _voice_audio(
                 (conversation_username, binding.server_id),
             ).fetchall()
         except Exception:
+            check_deadline()
             # A missing/wrong-key/unreadable explicitly supplied voice shard is
             # a controlled unavailable source. Do not establish uniqueness from
             # an incomplete set of explicitly supplied shards.
@@ -365,9 +376,10 @@ def _voice_audio(
         format_name=_silk_format(header),
         byte_count=length,
     )
-    if audio["format"] != "silk" or transcriber is None:
+    if audio["format"] != "silk" or (transcriber is None and _capture_payload is None):
         return audio, None
     try:
+        check_deadline()
         row = connection.execute(
             """SELECT voice_data FROM VoiceInfo AS voice
                JOIN Name2Id AS names ON names.rowid=voice.chat_name_id
@@ -383,20 +395,43 @@ def _voice_audio(
             or len(payload) != length
             or payload[:16] != header
             or _silk_format(payload[:16]) != "silk"
-            or any(before != (int(source.execute('PRAGMA data_version').fetchone()[0]),
-                              int(source.total_changes)) for source, before in source_epochs)
         ):
             return {**audio, "decode_status": "source_changed"}, None
+        for source, before in source_epochs:
+            check_deadline()
+            if before != (int(source.execute('PRAGMA data_version').fetchone()[0]), int(source.total_changes)):
+                return {**audio, "decode_status": "source_changed"}, None
         audio = {
             **audio,
             "audio_payload_sha256": hashlib.sha256(payload).hexdigest(),
         }
+        if _capture_payload is not None:
+            _capture_payload(payload)
+            if transcriber is None:
+                return audio, None
         transcription = transcriber.transcribe(payload)
         if not isinstance(transcription, LocalTranscription):
             raise TypeError("local transcriber returned an invalid result")
     except Exception:
+        check_deadline()
         return {**audio, "decode_status": "unavailable"}, None
     return {**audio, "decode_status": "transcribed"}, transcription
+
+
+@dataclass(frozen=True)
+class NativeVoiceIdentity:
+    """Only raw message fields used for audio association, not event revisions."""
+    server_id: int | None
+    local_id: int
+    create_time: int
+
+
+def capture_bound_voice(connections, username, identity, *, source_unavailable=False):
+    captured = []
+    audio, _ = _voice_audio(connections, username, identity, transcriber=None,
+                            source_unavailable=source_unavailable,
+                            _capture_payload=captured.append)
+    return audio, captured[0] if captured else None
 
 
 def _audio_result(

@@ -7,8 +7,11 @@ identity. It never searches all attachments or selects a file by size alone.
 
 from __future__ import annotations
 
+from .native_deadline import check_deadline
+
 import hashlib
 import io
+import json
 import os
 import re
 import stat
@@ -41,6 +44,29 @@ _STATIC_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a
 _V2_MAGIC = b"\x07\x08V2\x08\x07"
 
 
+def read_private_image_config(path: Path) -> tuple[tuple[int, ...], str]:
+    """Read the existing bounded private key-code format without exposing values."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            details = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(details.st_mode) or details.st_mode & 0o077
+                    or details.st_size > 16_384):
+                raise ValueError
+            payload = handle.read(16_385)
+        if len(payload) > 16_384:
+            raise ValueError
+        config = json.loads(payload.decode('utf-8'))
+        codes, scope = config['key_codes'], config['account_scope']
+        if (not isinstance(codes, list) or not codes or len(codes) > 256
+                or any(type(code) is not int or code < 0 for code in codes)
+                or not isinstance(scope, str) or not scope or len(scope) > 256):
+            raise ValueError
+        return tuple(codes), scope
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError('invalid_image_configuration') from None
+
+
 @dataclass(frozen=True)
 class ImageMessageIdentity:
     conversation_id: str
@@ -53,7 +79,7 @@ class ImageMessageIdentity:
     def __post_init__(self) -> None:
         if not self.conversation_id or self.server_id <= 0 or self.local_id < 0:
             raise ValueError("invalid_image_message_identity")
-        if self.local_type & 0xFFFFFFFF != 3:
+        if self.local_type & 0xFFFF != 3:
             raise ValueError("not_an_image_message")
 
 
@@ -92,6 +118,7 @@ def _read_same_inode(paths: list[Path], expected_size: int,
         def open_directories() -> int:
             parent = None
             for path, prior in directories:
+                check_deadline()
                 fd = os.open(path if parent is None else path.name,
                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                              **({} if parent is None else {'dir_fd': parent}))
@@ -113,6 +140,7 @@ def _read_same_inode(paths: list[Path], expected_size: int,
         expected = signature(before[0])
         if any(signature(item) != expected for item in before):
             raise ImageUnavailable('image_attachment_changed')
+        check_deadline()
         fd = os.open(paths[0].name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         try:
             opened = os.fstat(fd)
@@ -121,6 +149,7 @@ def _read_same_inode(paths: list[Path], expected_size: int,
             chunks = []
             remaining = expected_size + 1
             while remaining:
+                check_deadline()
                 chunk = os.read(fd, min(1024 * 1024, remaining))
                 if not chunk:
                     break
@@ -131,6 +160,7 @@ def _read_same_inode(paths: list[Path], expected_size: int,
                     or any(signature(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != expected for path in paths)):
                 raise ImageUnavailable('image_attachment_changed')
             open_directories()
+            check_deadline()
             return raw
         finally:
             os.close(fd)
@@ -143,45 +173,52 @@ def _read_same_inode(paths: list[Path], expected_size: int,
             os.close(handle)
 
 
-def _bound_file(
-    resource_connection: Any,
-    identity: ImageMessageIdentity,
-    attachments_root: Path,
-) -> ImageRepresentations:
-    """Resolve all metadata-sized representations for one exact message identity."""
-
+def _resource_facts(resource_connection: Any, identity: ImageMessageIdentity) -> tuple[Any, bytes, tuple[int, ...]]:
+    """Capture only the exact image resource metadata used for association."""
     _query_only(resource_connection)
     rows = resource_connection.execute(
         """SELECT i.message_id, i.packed_info
-             FROM MessageResourceInfo AS i
-             JOIN ChatName2Id AS n ON n.rowid = i.chat_id
+             FROM MessageResourceInfo AS i JOIN ChatName2Id AS n ON n.rowid = i.chat_id
             WHERE n.user_name = ? AND i.message_svr_id = ?
               AND i.message_local_id = ? AND i.message_create_time = ?
               AND i.message_local_type = ?""",
-        (
-            identity.conversation_id,
-            identity.server_id,
-            identity.local_id,
-            identity.create_time,
-            identity.local_type & 0xFFFFFFFF,
-        ),
+        (identity.conversation_id, identity.server_id, identity.local_id,
+         identity.create_time, identity.local_type & 0xFFFFFFFF),
     ).fetchall()
     if len(rows) != 1:
         raise ImageUnavailable("image_resource_ambiguous" if rows else "image_resource_missing")
     message_id, packed_info = rows[0]
     if not isinstance(message_id, (str, int)) or packed_info is None:
         raise ImageUnavailable("image_resource_unavailable")
+    try:
+        packed = bytes(packed_info)
+        sizes = tuple(sorted({int(row[0]) for row in resource_connection.execute(
+            "SELECT size FROM MessageResourceDetail WHERE message_id = ?", (message_id,)
+        ).fetchall() if row and row[0] is not None and int(row[0]) > 0}))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ImageUnavailable("image_resource_unavailable") from exc
+    return message_id, packed, sizes
+
+
+def _resource_fingerprint(facts: tuple[Any, bytes, tuple[int, ...]]) -> tuple[Any, bytes, int, tuple[int, ...]]:
+    """Keep bounded metadata rather than retaining the entire packed resource."""
+    message_id, packed, sizes = facts
+    return message_id, hashlib.sha256(packed).digest(), len(packed), sizes
+
+
+def _bound_file(
+    resource_connection: Any,
+    identity: ImageMessageIdentity,
+    attachments_root: Path,
+    *, _facts: tuple[Any, bytes, tuple[int, ...]] | None = None,
+) -> ImageRepresentations:
+    """Resolve all metadata-sized representations for one exact message identity."""
+
+    message_id, packed_info, detail_sizes = _facts if _facts is not None else _resource_facts(resource_connection, identity)
     tokens = {match.decode("ascii").lower() for match in _IMAGE_TOKEN.findall(bytes(packed_info))}
     if len(tokens) != 1:
         raise ImageUnavailable("image_resource_ambiguous")
-    sizes = {
-        int(row[0])
-        for row in resource_connection.execute(
-            "SELECT size FROM MessageResourceDetail WHERE message_id = ?",
-            (message_id,),
-        ).fetchall()
-        if row and row[0] is not None and int(row[0]) > 0
-    }
+    sizes = set(detail_sizes)
     if not sizes or any(size > MAX_INPUT_BYTES for size in sizes):
         raise ImageUnavailable("image_resource_unavailable")
     month = datetime.fromtimestamp(identity.create_time, identity.display_timezone).strftime("%Y-%m")
@@ -307,6 +344,53 @@ def _hevc_first_frame(data: bytes, ffmpeg: Path) -> bytes:
     return result.stdout
 
 
+def _trusted_decoder_directory(path: Path) -> bool:
+    """Check each ancestor, including symlink targets, before PATH execution."""
+    if not path.is_absolute():
+        return False
+    for component in (*reversed(path.parents), path):
+        info = component.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_uid not in (0, os.getuid()):
+                return False
+            resolved = component.resolve(strict=True)
+            if not _trusted_decoder_directory(resolved):
+                return False
+            info = resolved.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
+            return False
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            return False
+    return True
+
+
+def _image_ffmpeg(explicit: Path | None) -> Path:
+    """Use an explicit executable first, otherwise a trusted absolute PATH entry."""
+    if explicit is not None:
+        try:
+            if explicit.is_symlink() or not explicit.is_file() or not os.access(explicit,os.X_OK):
+                raise ImageUnavailable('image_decoder_config_invalid')
+            return explicit
+        except OSError as exc:
+            raise ImageUnavailable('image_decoder_config_invalid') from exc
+    path=os.environ.get('PATH','')
+    if len(path)>65536:raise ImageUnavailable('image_decoder_unavailable')
+    for entry in path.split(os.pathsep)[:128]:
+        if not entry or not os.path.isabs(entry):continue
+        try:
+            if not _trusted_decoder_directory(Path(entry)):continue
+            directory=Path(entry).resolve(strict=True);info=directory.stat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0,os.getuid()) or info.st_mode&0o022:continue
+            candidate=(directory/'ffmpeg').resolve(strict=True);details=candidate.stat()
+            if not _trusted_decoder_directory(candidate.parent):continue
+            if (stat.S_ISREG(details.st_mode) and details.st_uid in (0,os.getuid())
+                    and not details.st_mode&0o022 and os.access(candidate,os.X_OK)):
+                return candidate
+        except (OSError,RuntimeError):
+            continue
+    raise ImageUnavailable('image_decoder_unavailable')
+
+
 def decode_image(
     source: Path,
     *,
@@ -343,15 +427,15 @@ def _decode_image_bytes(
     try:
         if not raw or len(raw) > MAX_INPUT_BYTES:
             raise ImageUnavailable('image_input_unavailable')
+        if Image is None:
+            raise ImageUnavailable('image_decoder_unavailable')
         if raw.startswith(_V2_MAGIC):
             decoded = _decrypt_v2(raw, key_codes, account_scope)
         else:
             decoded = raw
         first_frame_only = False
         if decoded.startswith(b"wxgf"):
-            if ffmpeg is None or ffmpeg.is_symlink() or not ffmpeg.is_file():
-                raise ImageUnavailable("image_decoder_unavailable")
-            decoded = _hevc_first_frame(decoded, ffmpeg)
+            decoded = _hevc_first_frame(decoded, _image_ffmpeg(ffmpeg))
             first_frame_only = True
         if len(decoded) > MAX_OUTPUT_BYTES:
             raise ImageUnavailable("image_output_too_large")
@@ -391,11 +475,15 @@ def enrich_bound_images(
     key_codes: Iterable[int] = (),
     account_scope: str = "",
     ffmpeg: Path | None = None,
+    _capture_bound: Any = None,
 ) -> dict[str, Any]:
     """Decode each uniquely matched resource-size representation of one message."""
 
     try:
-        bound = _bound_file(resource_connection, identity, attachments_root)
+        if _capture_bound is None:
+            bound, verify = _bound_file(resource_connection, identity, attachments_root), None
+        else:
+            bound, verify = _capture_bound(identity, attachments_root)
     except ImageUnavailable as exc:
         return {"status": "unavailable", "reason": exc.code}
     decoded = []
@@ -408,6 +496,11 @@ def enrich_bound_images(
             result = _decode_image_bytes(captured, output_root=output_root, key_codes=key_codes,
                                          account_scope=account_scope, ffmpeg=ffmpeg)
         decoded.append({"resource_size_bytes": resource_size, **result})
+    if verify is not None:
+        try:
+            verify()
+        except ImageUnavailable as exc:
+            return {"status": "unavailable", "reason": exc.code}
     successes = sum(item.get("status") == "decoded" for item in decoded)
     if successes == len(decoded) and not bound.missing_sizes:
         status = "decoded"

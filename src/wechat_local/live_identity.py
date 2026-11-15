@@ -16,10 +16,10 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from .common import quote_identifier
-from .event_normalizer import _standard_id
-from .event_store import RawMessage, SourceKey
-from .live_catalog import LiveCatalog
-from .target_resolver import _display_name, _kind, _matched_fields, normalize
+from .source_ids import _standard_id
+from .source_records import RawMessage, SourceKey
+from .source_catalog import LiveCatalog
+from .contact_matching import _display_name, _kind, _matched_fields, normalize
 
 
 MAX_SOURCE_INPUT_BYTES = 262_144
@@ -77,6 +77,8 @@ class LiveIdentityAdapter:
         conversation_username: str | None = None,
         contact_connection: Any | None = None,
         contact_source_unavailable: bool = False,
+        alias_context: Any | None = None,
+        contact_source_identity: tuple | None = None,
     ) -> None:
         self.catalog = catalog
         self.self_username = self_username
@@ -84,6 +86,8 @@ class LiveIdentityAdapter:
         self.selected_conversation_username = conversation_username
         self.contact_connection = contact_connection
         self.contact_source_unavailable = contact_source_unavailable
+        self.alias_context = alias_context
+        self.contact_source_identity = contact_source_identity
         self._contact_schema_usable: bool | None = None
         self._conversation_names: dict[str, str] = {}
         self._sender_cache: dict[tuple[Any, ...], str | None] = {}
@@ -107,6 +111,9 @@ class LiveIdentityAdapter:
         self._contact_columns = set()
 
     def _epoch(self, connection: Any) -> tuple | None:
+        snapshot = getattr(self, '_window_snapshot', None)
+        if snapshot is not None and snapshot.active(connection):
+            return snapshot.epoch(connection)
         try:
             version = int(connection.execute("PRAGMA data_version").fetchone()[0])
             if connection not in self._connection_paths:
@@ -294,7 +301,7 @@ class LiveIdentityAdapter:
                     decoded = packed.decode("utf-8")
             if len(decoded) > MAX_SOURCE_OUTPUT_BYTES:
                 return unknown
-            from .event_normalizer import _parse_xml
+            from .message_parser import _parse_xml
             parsed = _parse_xml(decoded)
             root = parsed.root
             if root is None:
@@ -369,6 +376,38 @@ class LiveIdentityAdapter:
         status, epoch = self._contact_status_and_epoch()
         if status != 'configured' or epoch is None or self.contact_connection is None:
             return {'status': 'unavailable', 'reason': 'contact_source_' + status}, None
+        if self.alias_context is not None:
+            from .confirmed_aliases import AliasError
+            try:
+                binding = self.alias_context.lookup(query)
+            except AliasError as error:
+                return {'status': 'unavailable', 'reason': error.reason}, None
+            if binding is not None:
+                if binding.source_identity != self.contact_source_identity:
+                    return {'status': 'unavailable', 'reason': 'alias_source_identity_mismatch'}, None
+                if ((_kind is not None and binding.kind != _kind)
+                        or (binding.kind == 'group') != binding.username.endswith('@chatroom')
+                        or binding.username.startswith('gh_')):
+                    return {'status': 'unavailable', 'reason': 'contact_target_type_mismatch'}, None
+                try:
+                    rows = self.contact_connection.execute(
+                        'SELECT username,alias,remark,nick_name FROM contact WHERE username=? LIMIT 2',
+                        (binding.username,),
+                    ).fetchall()
+                    shadow = self.contact_connection.execute(
+                        'SELECT username FROM contact WHERE username COLLATE NOCASE IN (?,?) LIMIT 2',
+                        (query.strip(), normalize(query)),
+                    ).fetchall()
+                    if len(rows) != 1 or rows[0][0] != binding.username or any(r[0] != binding.username for r in shadow):
+                        return {'status': 'unavailable', 'reason': 'contact_identity_conflict'}, None
+                    if self._epoch(self.contact_connection) != epoch:
+                        return {'status': 'unavailable', 'reason': 'contact_source_changed'}, None
+                    item = {key: cell if isinstance(cell, str) else '' for key, cell in zip(('username','alias','remark','nick_name'), rows[0])}
+                    item.update(display_name=_display_name(item), matched_fields=['confirmed_alias'])
+                    return dict(status='resolved', match_basis='confirmed_alias', selected_username=binding.username,
+                                candidates=[item], total_candidates=1, truncated=False), epoch
+                except Exception:
+                    return {'status': 'unavailable', 'reason': 'contact_source_unavailable'}, None
         buckets: dict[str, list[dict[str, Any]]] = {'username': [], 'exact': [], 'partial': []}
         counts = {name: 0 for name in buckets}
         other_kind_exact = False
@@ -559,22 +598,3 @@ class LiveIdentityAdapter:
                 return False
         return self.conversation_username(source) == username
 
-    def evidence(self) -> SourceCapabilityEvidence:
-        from .codex_first_runtime import SourceCapabilityEvidence
-        # Capability is available only when the source schema can support a
-        # bounded lookup; each individual unmapped row remains explicitly unknown.
-        schema_available = any(
-            self._name2id_schema(shard.connection) for shard in self.catalog.shards
-        )
-        return SourceCapabilityEvidence(
-            direction_proven=self.self_username is not None and schema_available,
-            contact_mapping_proven=schema_available,
-            display_name=self.display_name,
-            direction_for_message=self.direction,
-            sender_identity=self.sender_identity,
-            sender_display_name=self.sender_display_name,
-            source_facts=self.source_facts,
-            conversation_identity_for_source=self.conversation_username,
-            conversation_kind=self.conversation_kind,
-            include_source=self.include_source,
-        )

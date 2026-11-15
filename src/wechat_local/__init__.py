@@ -1,15 +1,3 @@
-"""Local, offline processing for user-authorized WeChat snapshots."""
+"""Native local copies for user-authorized WeChat queries."""
 
-from .codex_first import ScanResult, TimeWindow
-
-__version__ = "0.4.1"
-
-__all__ = ("CodexFirstRuntime", "ScanResult", "TimeWindow")
-
-
-def __getattr__(name: str):
-    if name == "CodexFirstRuntime":
-        from .codex_first_runtime import CodexFirstRuntime
-
-        return CodexFirstRuntime
-    raise AttributeError(name)
+__version__ = "0.7.9"

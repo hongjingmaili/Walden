@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .live_catalog import LiveCatalogError, discover_numeric_shards
+from .source_catalog import LiveCatalogError, discover_numeric_shards
 from .live_readonly import LiveReadonlyError, open_encrypted_readonly, read_private_passphrase
 
 
@@ -32,14 +32,19 @@ _VOICE_COLUMNS = {"chat_name_id", "create_time", "local_id", "svr_id", "voice_da
 _NAME_COLUMNS = {"user_name"}
 _REQUIRED_CONFIG_FIELDS = {
     "runtime_python", "window_cli", "reply_cli", "live_db_root", "message_root",
-    "passphrase_file", "event_store", "agent_store", "account_id", "source_generation",
+    "passphrase_file", "account_id", "source_generation",
 }
 _OPTIONAL_CONFIG_FIELDS = {
+    "event_store", "agent_store",  # Existing evidence-only reply compatibility; never created.
     "session_database", "encrypted_contact_database", "image_database",
     "image_attachments_root", "image_output_root", "image_key_config",
-    "image_credentials_status", "voice_databases",
+    "image_credentials_status", "image_ffmpeg", "voice_databases",
+    "voice_runtime_root", "voice_python", "media_transcriber_version",
     "voice_discovery_complete", "voice_discovery_status", "setup_warnings",
-    "self_identity",
+    "self_identity", "query_timezone",
+    "mirror_root", "mirror_scope", "mirror_scope_mode", "scope_contract_id", "mirror_account_tables", "mirror_account_rows", "mirror_account_bytes", "mirror_account_shards", "mirror_account_inventory", "mirror_batch_size", "mirror_interval", "mirror_lock_timeout",
+    "follow_application_executable", "follow_poll_seconds", "follow_segment_seconds",
+    "follow_round_seconds", "follow_drain_seconds",
 }
 
 
@@ -455,8 +460,23 @@ def prepare_account_source(
     window_cli: Path,
     reply_cli: Path,
     confirm_self_username: str | None = None,
+    query_timezone: str | None = None,
+    mirror_scope: list[str] | None = None,
     _capture_observations: dict | None = None,
 ) -> dict[str, Any]:
+    if mirror_scope is not None and (not isinstance(mirror_scope, list) or not mirror_scope or any(not isinstance(u, str) or not u.strip() or u.strip() != u for u in mirror_scope) or len(set(mirror_scope)) != len(mirror_scope)):
+        return {'status': 'mirror_scope_invalid'}
+    if mirror_scope is not None:
+        try:
+            for username in mirror_scope:
+                _validate_mirror_username(username)
+        except SourceSetupError:
+            return {'status': 'mirror_scope_invalid'}
+    if query_timezone is not None:
+        try:
+            ZoneInfo(query_timezone)
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            return {"status": "query_timezone_invalid"}
     if _capture_observations and passphrase_file is not None:
         if not _owned_capture_parent(Path(passphrase_file), _capture_observations.get('credential_parent_identity')):
             return {"status": "credential_source_changed"}
@@ -637,8 +657,6 @@ def prepare_account_source(
         "live_db_root": str(db_storage),
         "message_root": str(message_root),
         "passphrase_file": str(Path(passphrase_file).expanduser().resolve(strict=False)),
-        "event_store": str(stores / "events.sqlite"),
-        "agent_store": str(stores / "agents.sqlite"),
         "account_id": f"local-{uuid.uuid4()}",
         "source_generation": f"generation-{uuid.uuid4()}",
         "voice_databases": voice_paths if scan_complete else [],
@@ -647,6 +665,11 @@ def prepare_account_source(
         "setup_warnings": sorted(set(warnings)),
         "image_credentials_status": "not_configured",
     }
+    if mirror_scope is not None:
+        profile['mirror_scope'] = list(mirror_scope)
+        profile['mirror_root'] = str(stores / 'native-mirrors' / profile['account_id'] / profile['source_generation'])
+    if query_timezone is not None:
+        profile["query_timezone"] = query_timezone
     if confirm_self_username is not None:
         profile["self_identity"] = {
             "username": confirm_self_username, **_self_identity_binding(profile),
@@ -730,20 +753,27 @@ def _preflight_capture_outputs(account_root: Path, config_path: Path, output_dat
     return None
 
 
+def _validate_mirror_username(username: Any) -> None:
+    # Mirrors accept both private and group Name2Id usernames; self does not.
+    if (not isinstance(username, str) or not username.strip() or username.strip() != username
+            or any(ord(c) < 32 for c in username)):
+        raise SourceSetupError('mirror_scope_invalid')
+
+
 def _validate_self_username(username: Any) -> None:
     # A stable username, never a display name, room token or filesystem path.
     if not isinstance(username, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", username) is None:
         raise SourceSetupError("self_username_invalid")
 
 
-def _self_identity_binding(profile: Mapping[str, Any]) -> dict[str, str]:
+def _self_identity_binding(profile: Mapping[str, Any], *, physical: bool = True) -> dict[str, str]:
     roots: dict[str, str] = {}
     for field in ("live_db_root", "message_root"):
         path = Path(profile[field]).expanduser()
         if not path.is_absolute():
             raise SourceSetupError("self_identity_binding_mismatch")
         try:
-            roots[field] = str(path.resolve(strict=False))
+            roots[field] = str(path.resolve(strict=False)) if physical else os.path.abspath(path)
         except (OSError, RuntimeError, ValueError) as exc:
             raise SourceSetupError("self_identity_binding_mismatch") from exc
     if not _contained(Path(roots["message_root"]), Path(roots["live_db_root"])):
@@ -751,7 +781,7 @@ def _self_identity_binding(profile: Mapping[str, Any]) -> dict[str, str]:
     return {"account_id": profile["account_id"], "source_generation": profile["source_generation"], **roots}
 
 
-def _confirmed_self_username(profile: Mapping[str, Any]) -> str | None:
+def _confirmed_self_username(profile: Mapping[str, Any], *, physical: bool = True) -> str | None:
     if "self_identity" not in profile:
         return None
     identity = profile["self_identity"]
@@ -760,7 +790,7 @@ def _confirmed_self_username(profile: Mapping[str, Any]) -> str | None:
     }:
         raise SourceSetupError("self_identity_invalid")
     _validate_self_username(identity["username"])
-    if any(identity[field] != value for field, value in _self_identity_binding(profile).items()):
+    if any(identity[field] != value for field, value in _self_identity_binding(profile, physical=physical).items()):
         raise SourceSetupError("self_identity_binding_mismatch")
     return identity["username"]
 
@@ -776,6 +806,18 @@ def _decode_source_config(data: bytes) -> dict[str, Any]:
         raise SourceSetupError("Source config has unsupported fields")
     if any(not isinstance(value[key], str) or not value[key] for key in _REQUIRED_CONFIG_FIELDS):
         raise SourceSetupError("Source config fields are invalid")
+    for key in ('event_store', 'agent_store'):
+        if key in value and (not isinstance(value[key], str) or not value[key]):
+            raise SourceSetupError('Source config evidence path is invalid')
+    if value.get('image_ffmpeg') is not None and (type(value['image_ffmpeg']) is not str or not Path(value['image_ffmpeg']).is_absolute() or chr(0) in value['image_ffmpeg']):raise SourceSetupError('image_ffmpeg_invalid')
+    runtime_pair=('voice_runtime_root','voice_python')
+    if any(key in value for key in runtime_pair):
+        if not all(type(value.get(key)) is str and Path(value[key]).is_absolute() and chr(0) not in value[key] for key in runtime_pair):
+            raise SourceSetupError('voice_runtime_pair_invalid')
+    if 'media_transcriber_version' in value:
+        token=value['media_transcriber_version']
+        if type(token) is not str or not 1<=len(token)<=160 or any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:+/-' for ch in token):
+            raise SourceSetupError('media_transcriber_version_invalid')
     if "voice_databases" in value and (
         not isinstance(value["voice_databases"], list)
         or any(not isinstance(item, str) or not item for item in value["voice_databases"])
@@ -788,6 +830,23 @@ def _decode_source_config(data: bytes) -> dict[str, Any]:
         or any(not isinstance(item, str) for item in value["setup_warnings"])
     ):
         raise SourceSetupError("Source config warnings are invalid")
+    if "query_timezone" in value and (not isinstance(value["query_timezone"], str) or not value["query_timezone"]):
+        raise SourceSetupError("Source config timezone is invalid")
+    if 'mirror_root' in value or 'mirror_scope' in value:
+        if not isinstance(value.get('mirror_root'), str) or not Path(value['mirror_root']).is_absolute():
+            raise SourceSetupError('Mirror root must be absolute')
+        from .native_scope_contract import mode
+        try:mode(value)
+        except Exception:raise SourceSetupError('Mirror scope mode or membership is invalid') from None
+        for key in ('mirror_batch_size', 'mirror_interval', 'mirror_lock_timeout'):
+            if key in value and (type(value[key]) is not int or value[key] < 1):
+                raise SourceSetupError('Mirror numeric setting must be positive')
+    from .native_follow_config import FIELDS, settings
+    if FIELDS.intersection(value):
+        try:
+            settings(value)
+        except ValueError:
+            raise SourceSetupError('follow_settings_invalid') from None
     return value
 
 
@@ -819,15 +878,21 @@ def _read_source_config_fd(fd: int) -> tuple[dict[str, Any], bytes, os.stat_resu
     return profile, data, mode
 
 
-def load_source_config(path: Path) -> dict[str, Any]:
+def load_source_config(path: Path, *, physical: bool = True) -> dict[str, Any]:
     try:
+        from .native_scope_add import scope_guard
+        from .native_scope_contract import loaded_scope_guard
+        scope_before = scope_guard(path)
         fd = os.open(Path(path).expanduser(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             profile, _, _ = _read_source_config_fd(fd)
         finally:
             os.close(fd)
-        if _confirmed_self_username(profile) is not None:
+        loaded_scope_guard(path, profile)
+        if _confirmed_self_username(profile, physical=physical) is not None:
             _check_identity_config_parents(path)
+        scope_guard(path, scope_before)
+        loaded_scope_guard(path, profile)
         return profile
     except OSError as exc:
         raise SourceSetupError("Source config must be a private regular file") from exc
@@ -905,110 +970,15 @@ def confirm_source_identity(path: Path, username: str, *, replace: bool = False)
             os.close(directory_fd)
 
 
-def apply_source_config_to_args(args: Any) -> dict[str, Any] | None:
-    """Load one profile and fill only source arguments the caller omitted."""
-
-    explicit_self = getattr(args, "self_username", None)
-    if explicit_self is not None:
-        _validate_self_username(explicit_self)
-    args.voice_source_unavailable = False
-    args.configured_image_unavailable = False
-    if args.source_config is None:
-        if args.configured_images:
-            raise SourceSetupError("--configured-images requires --source-config")
-        return None
-    explicit_source_fields = (
-        "live_db_root", "message_root", "passphrase", "event_store", "agent_store",
-        "account_id", "source_generation", "contact_database", "encrypted_contact_database",
-        "voice_database", "image_database", "image_attachments_root", "image_output_root",
-        "image_key_config",
-    )
-    if any(getattr(args, field, None) for field in explicit_source_fields):
-        raise SourceSetupError("Do not combine --source-config with explicit source paths")
-    profile = load_source_config(args.source_config)
-    confirmed_self = _confirmed_self_username(profile)
-    if confirmed_self is not None:
-        if explicit_self is not None and explicit_self != confirmed_self:
-            raise SourceSetupError("self_identity_conflict")
-        args.self_username = confirmed_self
-    args.live_db_root = Path(profile["live_db_root"])
-    args.message_root = Path(profile["message_root"])
-    args.passphrase = Path(profile["passphrase_file"])
-    args.event_store = Path(profile["event_store"])
-    args.agent_store = Path(profile["agent_store"])
-    args.account_id = profile["account_id"]
-    args.source_generation = profile["source_generation"]
-    contact = profile.get("encrypted_contact_database")
-    args.encrypted_contact_database = Path(contact) if contact else None
-    if args.voice_transcripts:
-        try:
-            require_complete_voice_source(profile)
-            args.voice_database = [Path(value) for value in profile["voice_databases"]]
-        except SourceSetupError:
-            # Continue the text query, but mark voice enrichment unavailable;
-            # the existing enricher will preserve the base message and skip ASR.
-            args.voice_database = []
-            args.voice_source_unavailable = True
-    if args.configured_images:
-        image_values = (
-            profile.get("image_database"),
-            profile.get("image_attachments_root"),
-            profile.get("image_output_root"),
-        )
-        if all(isinstance(value, str) and value for value in image_values):
-            args.image_database, args.image_attachments_root, args.image_output_root = map(Path, image_values)
-        else:
-            args.configured_image_unavailable = True
-        image_key_config = profile.get("image_key_config")
-        if isinstance(image_key_config, str) and image_key_config:
-            args.image_key_config = Path(image_key_config)
-    args.source_profile = profile
-    return profile
 
 
-def _initial_message_baseline(config_path: Path, request: str, timezone_name: str = 'UTC') -> dict[str, Any]:
-    """Run the existing bounded window without exposing its message payload."""
-    from .codex_first_runtime import main as window_main
-
-    output = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(output):
-            code = window_main(['--source-config', str(config_path), '--request', request,
-                                '--timezone', timezone_name, '--display-limit', '1', '--json'])
-        payload = json.loads(output.getvalue())
-    except Exception:
-        return {'status': 'incomplete', 'stage': 'window', 'reason': 'unknown', 'reuse_scope': 'empty_sources_only'}
-    if not isinstance(payload, dict) or not isinstance(payload.get('gaps', []), list):
-        return {'status': 'incomplete', 'stage': 'window', 'reason': 'unknown', 'reuse_scope': 'empty_sources_only'}
-    allowed_gaps = {'known_source_missing', 'live_source_unavailable', 'source_read_unavailable',
-                    'source_changed', 'source_excluded_by_classification_policy',
-                    'timestamp_integrity_unknown_outside_requested_window',
-                    'direction_or_contact_mapping_unavailable', 'direction_identity_unavailable',
-                    'event_projection_unavailable', 'confirmation_required', 'baseline_state_unavailable'}
-    gaps = [value if value in allowed_gaps else 'unknown' for value in payload.get('gaps', []) if isinstance(value, str)]
-    incomplete = {'known_source_missing', 'live_source_unavailable', 'source_read_unavailable',
-                  'source_changed', 'event_projection_unavailable', 'confirmation_required', 'baseline_state_unavailable', 'unknown'}
-    if code == 0 and payload.get('status') == 'ok' and not incomplete.intersection(gaps):
-        return {'status': 'ready', 'coverage_status': payload.get('coverage_status', 'unknown') if payload.get('coverage_status') in {'complete', 'partial', 'unknown'} else 'unknown', 'gaps': gaps, 'reuse_scope': 'empty_sources_only'}
-    reasons = {'source_changed', 'source_unavailable', 'configuration_unavailable',
-               'runtime_unavailable', 'confirmation_required', 'source_read_unavailable'}
-    reason = payload.get('error_code')
-    stage = 'window'
-    diagnostics = payload.get('diagnostics')
-    failures = diagnostics.get('failures') if isinstance(diagnostics, dict) else None
-    if isinstance(failures, list) and failures and isinstance(failures[0], dict):
-        actual_stage = failures[0].get('stage')
-        if actual_stage in {'configuration', 'source_open', 'source_read', 'result_processing'}:
-            stage = actual_stage
-    coverage = payload.get('coverage_status')
-    return {'status': 'incomplete', 'stage': stage, 'reason': reason if reason in reasons else 'unknown', 'coverage_status': coverage if coverage in {'complete', 'partial', 'unknown'} else 'unknown', 'gaps': gaps, 'reuse_scope': 'empty_sources_only'}
 
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="Configure one explicit WeChat account root")
+    parser = argparse.ArgumentParser(description="Configure one explicit WeChat account root and authorized native scope. Setup writes a private profile only; run wechat-local-sync init separately. Fresh native setup does not produce existing-evidence reply materializations.")
     parser.add_argument("--account-root", type=Path)
     parser.add_argument("--confirm-self-username", help="stable username explicitly confirmed by the user for this source")
     parser.add_argument("--replace-self-identity", action="store_true", help="explicitly correct/rebind an existing saved identity")
@@ -1020,21 +990,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-timeout", type=float, help="Capture seconds (default: 0, waits until completion or cancellation)")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--data-home", type=Path)
-    parser.add_argument("--baseline-request", help="initial bounded window (default: 最近3小时)")
-    parser.add_argument("--baseline-timezone", help="IANA time zone required with --baseline-request")
+    parser.add_argument("--mirror-username", dest="mirror_scope", action="append", help="explicit stable username authorized for native init; repeat for each scope")
+    parser.add_argument("--timezone", help="explicit IANA query timezone saved for native windows")
     args = parser.parse_args(argv)
     target_options = (args.wechat_executable, args.wechat_data_home, args.lldb_executable)
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     output_data_home = args.data_home or Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     config_path = args.config or config_home / "wechat-local" / "current-source.json"
-    if args.baseline_request is not None and args.baseline_timezone is None:
-        print(json.dumps({'status': 'baseline_timezone_required'}, sort_keys=True))
+    if args.account_root is not None and not args.mirror_scope:
+        print(json.dumps({'status': 'mirror_scope_required'}, sort_keys=True))
         return 2
-    if args.baseline_timezone is not None:
+    if args.mirror_scope is not None:
         try:
-            ZoneInfo(args.baseline_timezone)
+            if len(set(args.mirror_scope)) != len(args.mirror_scope):
+                raise SourceSetupError('mirror_scope_invalid')
+            for username in args.mirror_scope:
+                _validate_mirror_username(username)
+        except SourceSetupError:
+            print(json.dumps({'status': 'mirror_scope_invalid'}, sort_keys=True))
+            return 2
+    if args.timezone is not None:
+        try:
+            ZoneInfo(args.timezone)
         except (ZoneInfoNotFoundError, ValueError):
-            print(json.dumps({'status': 'baseline_timezone_invalid'}, sort_keys=True))
+            print(json.dumps({'status': 'query_timezone_invalid'}, sort_keys=True))
             return 2
     if args.confirm_self_username is not None:
         try:
@@ -1045,7 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.account_root is None:
         if args.confirm_self_username is None or (
             args.acquire_passphrase or args.passphrase_file is not None or args.data_home is not None
-            or any(item is not None for item in target_options) or args.capture_timeout is not None or args.baseline_request is not None or args.baseline_timezone is not None
+            or any(item is not None for item in target_options) or args.capture_timeout is not None or args.mirror_scope is not None or args.timezone is not None
         ):
             print(json.dumps({"status": "identity_update_arguments_invalid"}, sort_keys=True))
             return 2
@@ -1140,6 +1119,8 @@ def main(argv: list[str] | None = None) -> int:
             window_cli=window_cli,
             reply_cli=reply_cli,
             confirm_self_username=args.confirm_self_username,
+            mirror_scope=args.mirror_scope,
+            **({'query_timezone': args.timezone} if args.timezone is not None else {}),
             _capture_observations=capture_observations if args.acquire_passphrase else None,
         )
     except Exception as exc:
@@ -1156,17 +1137,12 @@ def main(argv: list[str] | None = None) -> int:
 
             if _owned_capture_parent(Path(str(passphrase_file)), captured_parent_identity):
                 _unlink_owned(Path(str(passphrase_file)), captured_identity)
-    baseline_cancelled = False
     if result['status'] in {'configured', 'configured_with_voice_incomplete'}:
-        try:
-            result['message_baseline'] = _initial_message_baseline(config_path, args.baseline_request or '最近3小时', args.baseline_timezone or 'UTC')
-        except KeyboardInterrupt:
-            baseline_cancelled = True
-            result['message_baseline'] = {'status': 'incomplete', 'stage': 'window', 'reason': 'cancelled', 'reuse_scope': 'empty_sources_only'}
+        result['next_step'] = 'init'
+        # No source query or EventStore baseline in native setup.
         result['self_identity'] = {'status': 'confirmed' if args.confirm_self_username is not None else 'incomplete'}
-        result['mute_status'] = {'status': 'incomplete', 'reason': 'mute_coverage_incomplete'}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 130 if baseline_cancelled else (0 if result["status"] in {"configured", "configured_with_voice_incomplete"} else 2)
+    return 0 if result["status"] in {"configured", "configured_with_voice_incomplete"} else 2
 
 
 if __name__ == "__main__":

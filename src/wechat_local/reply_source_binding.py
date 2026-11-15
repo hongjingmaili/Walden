@@ -6,14 +6,14 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from .event_normalizer import _standard_id
-from .event_store import EventStore, RawMessage, SourceKey, _content_fingerprint
-from .live_catalog import SHARD_NAME_PATTERN, TABLE_NAME_PATTERN
+from .source_ids import _standard_id
+from .source_records import RawMessage, SourceKey, _content_fingerprint
+from .source_catalog import SHARD_NAME_PATTERN, TABLE_NAME_PATTERN
 from .live_identity import LiveIdentityAdapter, _username_for_table
 from .live_readonly import open_encrypted_readonly, read_private_passphrase, readonly_database_uri
-from .live_tailer import _table_columns
+from .source_schema import _table_columns
 from .source_setup import load_source_config
-from .standard_event_repository import ProjectionProfile
+from .reply_evidence import ProjectionProfile, _association_conflict
 
 
 class ReplySourceError(ValueError):
@@ -158,9 +158,7 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
                 raise ReplySourceError('source_unavailable')
             candidates.append((source, row['local_id'], row['server_id'], row['local_type'], row['create_time'], row['real_sender_id'], row['content_fingerprint']))
             bindings.append((event_id, row['event_uid'], row['revision_id'], row['content_fingerprint'], conversation, source_stamp[0][:2]))
-        store = object.__new__(EventStore)
-        store._conn = db
-        if store._association_conflict(candidates):
+        if _association_conflict(db, candidates):
             raise ReplySourceError('conversation_attribution_conflict')
         if (db.execute('PRAGMA data_version').fetchone()[0] != store_version or _stamp(store_path) != store_stamp
                 or contact.execute('PRAGMA data_version').fetchone()[0] != contact_version or _stamp(contact_path) != contact_stamp
