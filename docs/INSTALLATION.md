@@ -18,9 +18,40 @@ python3 -m venv "$WALDEN_VENV"
 
 ## 配置和同步
 
-使用同一环境中的 `wechat-local-setup --help` 查看配置选项。首次配置时通过 `--account-root` 指定确认过的账号目录，通过 `--mirror-username` 指定确认授权的会话稳定标识，可以重复指定。可用 `--timezone` 保存查询时区。配置只创建私有配置，不启动同步。
+首次配置前，准备以下信息：
 
-已授权复制时，依次调用同一环境的 `wechat-local-sync init --source-config` 和 `wechat-local-sync once --source-config`，两条命令均传入实际配置文件。用 `wechat-local-sync status --source-config` 查看覆盖和进度。有些历史需要多轮才能补齐。
+- 你有权查询的微信账号目录，使用微信原有的 `Documents/xwechat_files/<账号目录>` 布局，并指向其中一个账号目录。
+- 至少一个你确认要同步的会话稳定标识。用 `--mirror-username` 传入；多个会话可重复指定。昵称和备注不能代替稳定标识。尚未确认标识时，先停在配置前。
+- 安装在 `/Applications/WeChat.app` 的微信客户端，以及通过 `xcrun --find lldb` 能找到的调试器。时区按自己的实际情况选择，例如 `Asia/Shanghai`。
+
+### 首次获取凭据
+
+沿用安装时的 `WALDEN_VENV`，把示例里的账号目录、会话标识和时区换成自己的值。首次配置需要显式加上 `--acquire-passphrase`，程序会在本机获取和验证凭据：
+
+```sh
+"$WALDEN_VENV/bin/wechat-local-setup" \
+  --account-root "/实际路径/Documents/xwechat_files/账号目录" \
+  --mirror-username "已确认的会话稳定标识" \
+  --timezone Asia/Shanghai \
+  --acquire-passphrase
+```
+
+看到 `configured` 或 `configured_with_voice_incomplete` 后再继续。后者表示配置已完成，语音能力仍有缺口。默认配置路径为 `${XDG_CONFIG_HOME:-$HOME/.config}/wechat-local/current-source.json`。如果显式传了 `--config`，后续使用同一个文件。
+
+若出现 `credentials_required`，检查命令是否省略了 `--acquire-passphrase`。若客户端、调试器或验证步骤报错，先根据错误处理当前账号的配置。取钥前提、错误说明和已有同账号凭据的高级导入方式见[随包技能的首次配置说明](../skills/wechat-local-query/SKILL.md#first-setup-explicit-scope-and-existing-copies)。
+
+### 初始化本地副本
+
+配置成功后，已授权复制时再执行：
+
+```sh
+WALDEN_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/wechat-local/current-source.json"
+"$WALDEN_VENV/bin/wechat-local-sync" init --source-config "$WALDEN_CONFIG"
+"$WALDEN_VENV/bin/wechat-local-sync" once --source-config "$WALDEN_CONFIG"
+"$WALDEN_VENV/bin/wechat-local-sync" status --source-config "$WALDEN_CONFIG"
+```
+
+设置过 `--config` 时，将 `WALDEN_CONFIG` 换成你选的路径。先检查覆盖和缺口再查消息，有些历史需要多轮才能补齐。
 
 自动后台复制需要单独启用。用同一环境的 `wechat-local-sync follow-enable`、`follow-status`、`follow-disable` 管理已配置来源的服务，并给各命令传入同一个 `--source-config`。服务登记成功和来源同步健康是两个状态。切换或回退前先确认原服务及其子任务已经停止。
 
