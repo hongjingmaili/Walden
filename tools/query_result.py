@@ -40,6 +40,8 @@ MESSAGE_PATHS = (("messages",), ("body", "messages"), ("result", "messages"),
 REQUEST_RANGE_PATHS = tuple((*path[:-1], "coverage", "request_range") for path in MESSAGE_PATHS)
 UNPROVEN_RANGE_REASONS = (
     "observation_evidence_missing", "account_recent_vector_not_proven", "no_recent_range_observation",
+    "requested_order_not_observed", "requested_time_outside_observation",
+    "requested_page_exceeds_recent_observation",
 )
 
 WINDOW_SWITCHES = frozenset((*MEDIA_FLAGS, "--json"))

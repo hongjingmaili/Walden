@@ -593,7 +593,13 @@ def test_a3_scope_source_conflict_classified_and_escalated(tmp_path, sandbox):
     assert code == 2 and view["outcome"] == "cli_failed"
 
 
-@pytest.mark.parametrize("range_reason", ["observation_evidence_missing", "account_recent_vector_not_proven"])
+@pytest.mark.parametrize("range_reason", [
+    "observation_evidence_missing",
+    "account_recent_vector_not_proven",
+    "requested_order_not_observed",
+    "requested_time_outside_observation",
+    "requested_page_exceeds_recent_observation",
+])
 def test_formal_local_result_preserves_optional_unknown_metadata_as_success(tmp_path, sandbox, range_reason):
     messages = [dict(text="synthetic", source_facts=dict(
         mentions=dict(status="unknown", at_self="unknown", notify_all="unknown")))]
@@ -601,7 +607,11 @@ def test_formal_local_result_preserves_optional_unknown_metadata_as_success(tmp_
         status="unknown", reason=range_reason, as_of=None))
     data = dict(messages=messages, coverage=coverage, source_opens=0, gaps=[], freshness="local_snapshot")
     cli, _, _ = stub(tmp_path, data)
-    view, code = q.page(capture([str(cli)]))
+    if range_reason in {"requested_order_not_observed", "requested_time_outside_observation"}:
+        request = ["--request", "2020-01-15到2020-01-15", "--timezone", "Asia/Shanghai"]
+    else:
+        request = ["--latest", "20"]
+    view, code = q.page(capture([str(cli), *request]))
 
     assert code == 0
     assert view["outcome"] == "cli_returned" and view["issues"] == []
