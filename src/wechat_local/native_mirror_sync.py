@@ -825,8 +825,10 @@ def _account_sync(config,*,connection_factory=None):
         sc.save(registry,'shard_cursor',(offset+1)%max(1,len(paths)));sc.save(registry,'roster',sorted(set(prior)|set(roster)))
         sc.save(registry,'last_attempt',dict(at_ns=time.time_ns(),gaps=sorted(set(result['gaps']))));_account_registry_commit(registry)
         sc.query_scope_guard(config,before)
-    from .native_scope_contract import account_status
-    status=account_status(config);result['account_scope']=status
+        # The committed registry and local shards cannot advance while this
+        # round holds the writer lock. Keep the terminal metadata view read-only.
+        status=sc.account_status(config,_writer_locked=True)
+    result['account_scope']=status
     result['follow_observation']=dict(observation_id=os.urandom(16).hex(),complete=status['raw_messages_complete'],known_backlog=status['known_backlog'],watermarks=[],atomic_global_snapshot=False,final_completeness='not_promised')
     result['elapsed_seconds']=20.-max(0,budget['until']-time.monotonic());return result
 

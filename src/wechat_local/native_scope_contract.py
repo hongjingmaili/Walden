@@ -126,12 +126,17 @@ def _safe(path):
         return (value.st_dev,value.st_ino)
     finally:os.close(fd)
 
+def _registry_page_size(conn):
+    page_size=conn.execute('PRAGMA page_size').fetchone()[0];pages=conn.execute('PRAGMA page_count').fetchone()[0]
+    need(page_size*pages<=64*1024*1024,'local_registry_snapshot_budget')
+    return page_size
+
+
 def _registry_snapshot(conn):
     """One coherent metadata snapshot; no disk read lock survives the copy."""
     import time
     from .native_deadline import _current
-    page_size=conn.execute('PRAGMA page_size').fetchone()[0];pages=conn.execute('PRAGMA page_count').fetchone()[0]
-    need(page_size*pages<=64*1024*1024,'local_registry_snapshot_budget')
+    page_size=_registry_page_size(conn)
     snapshot=sqlite3.connect(':memory:',timeout=.1);started=time.monotonic();deadline=_current.get()
     def progress(status,remaining,total):
         if deadline is not None:deadline.check()
@@ -257,19 +262,27 @@ from .failure_evidence import _register
 _register(mode,fixed,binding,limited,token,query_scope_guard,loaded_scope_guard,registry,register,member,authorized,selection)
 
 
-def account_status(config,*,offset=0,limit=100,include_targets=False):
-    """Local metadata only. Authorization is distinct from copied/queryable state."""
+def account_status(config,*,offset=0,limit=100,include_targets=False,_writer_locked=False):
+    """Read local metadata. Only an owning writer may keep a direct read transaction."""
+    from .native_deadline import Deadline, _current, check_deadline
     before=query_scope_guard(config)
+    deadline=_current.get() if _writer_locked else None
     need(type(offset) is int and offset>=0 and type(limit) is int and 1<=limit<=1000,'scope_pagination')
     targets=[];counts=dict(registered=0,copied=0,raw_complete=0,identity_unknown=0,unsupported=0)
     gaps=[];watermarks=[]
     root=Path(config['mirror_root'])
-    with registry(config) as db:
-        roster=state(db,'roster',[]);inventory=[state(db,'inventory:'+s,{}) for s in roster]
-        inventory_complete=bool(roster) and all(v.get('complete') is True for v in inventory)
+    with registry(config,snapshot=not _writer_locked) as db:
+        if _writer_locked:
+            check_deadline()
+            _registry_page_size(db)
+        roster=state(db,'roster',[]);inventory=[]
         last=state(db,'last_attempt',{});gaps+=last.get('gaps',[])
         local_progress={}
         for shard in roster:
+            # Check the clocks during the local scan. The enclosing status call
+            # also revalidates the complete grant on entry and exit.
+            if deadline is not None:Deadline.check(deadline)
+            inventory.append(state(db,'inventory:'+shard,{}))
             gaps+=state(db,'gaps:'+shard,[])
             path=root/shard
             if not path.is_file():continue
@@ -278,9 +291,15 @@ def account_status(config,*,offset=0,limit=100,include_targets=False):
             try:
                 conn.execute('PRAGMA query_only=ON')
                 need(conn.execute('SELECT * FROM __walden_binding').fetchall()==[(config['account_id'],config['source_generation'],shard)],'source_identity_mismatch')
-                local_progress[shard]={t:json.loads(v) for t,v in conn.execute('SELECT table_name,value FROM __walden_progress')}
+                progress_by_table={}
+                for index,(table,value) in enumerate(conn.execute('SELECT table_name,value FROM __walden_progress')):
+                    if deadline is not None and index%64==0:Deadline.check(deadline)
+                    progress_by_table[table]=json.loads(value)
+                local_progress[shard]=progress_by_table
             finally:conn.close()
-        for shard,table in db.execute('SELECT shard,table_name FROM members ORDER BY shard,table_name').fetchall():
+        inventory_complete=bool(roster) and all(v.get('complete') is True for v in inventory)
+        for shard,table in db.execute('SELECT shard,table_name FROM members ORDER BY shard,table_name'):
+            if deadline is not None and counts['registered']%64==0:Deadline.check(deadline)
             proof=member(config,db,shard,table);counts['registered']+=1
             if proof.get('username') is None:counts['identity_unknown']+=1
             if not proof.get('supported'):counts['unsupported']+=1;gaps.append('unsupported_message_schema')
@@ -298,6 +317,8 @@ def account_status(config,*,offset=0,limit=100,include_targets=False):
     from .native_media_work import backfill_status
     media_backfill=backfill_status(config)
     query_scope_guard(config,before)
+    if _writer_locked:
+        check_deadline()
     raw_complete=bool(inventory_complete and counts['registered'] and counts['raw_complete']==counts['registered'] and not counts['unsupported'] and not gaps)
     return dict(scope_mode='account',account_authorized=True,contract_id=config[ID],inventory_complete=inventory_complete,
         inventory_refresh_requested_shards=sum(v.get('refresh_requested') is True for v in inventory),inventory_evidence='last_bounded_stable_pass_not_atomic_current_source',
@@ -525,4 +546,4 @@ def reanchor_cli(config, config_path, *, expected_source_sha256, authorize=False
     return result
 
 
-_register(_registry_snapshot,account_status,_register_members,state,save,_safe,_optional,_pending,target_ref)
+_register(_registry_page_size,_registry_snapshot,account_status,_register_members,state,save,_safe,_optional,_pending,target_ref)
