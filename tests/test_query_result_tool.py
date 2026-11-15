@@ -591,3 +591,43 @@ def test_a3_scope_source_conflict_classified_and_escalated(tmp_path, sandbox):
     assert view["cli_error_classification"]["category"] == "scope_source_conflict"
     assert view["escalate"] is True and view["need_user_clarification"] is False
     assert code == 2 and view["outcome"] == "cli_failed"
+
+
+@pytest.mark.parametrize("range_reason", ["observation_evidence_missing", "account_recent_vector_not_proven"])
+def test_formal_local_result_preserves_optional_unknown_metadata_as_success(tmp_path, sandbox, range_reason):
+    messages = [dict(text="synthetic", source_facts=dict(
+        mentions=dict(status="unknown", at_self="unknown", notify_all="unknown")))]
+    coverage = dict(history_complete=True, request_range=dict(
+        status="unknown", reason=range_reason, as_of=None))
+    data = dict(messages=messages, coverage=coverage, source_opens=0, gaps=[], freshness="local_snapshot")
+    cli, _, _ = stub(tmp_path, data)
+    view, code = q.page(capture([str(cli)]))
+
+    assert code == 0
+    assert view["outcome"] == "cli_returned" and view["issues"] == []
+    assert view["messages"] == messages
+    assert view["context"]["coverage"] == coverage
+
+
+@pytest.mark.parametrize("failure", ["gap", "mention_failure", "range_conflict", "other_unknown", "command_exit"])
+def test_optional_unknown_metadata_does_not_hide_other_failures(tmp_path, sandbox, failure):
+    mentions = dict(status="unknown")
+    request_range = dict(status="unknown", reason="account_recent_vector_not_proven", as_of=None)
+    data = dict(messages=[dict(text="synthetic", source_facts=dict(mentions=mentions))],
+                coverage=dict(history_complete=True, request_range=request_range),
+                source_opens=0, gaps=[], freshness="local_snapshot")
+    if failure == "gap":
+        data["gaps"].append("history_incomplete")
+    elif failure == "mention_failure":
+        mentions["status"] = "failed"
+    elif failure == "range_conflict":
+        request_range["reason"] = "conversation_attribution_conflict"
+    elif failure == "other_unknown":
+        # A key made to look like a known path must not receive its exemption.
+        data["messages[0].source_facts.mentions"] = dict(status="unknown")
+    cli, _, _ = stub(tmp_path, data, exit_code=1 if failure == "command_exit" else 0)
+    view, code = q.page(capture([str(cli)]))
+    assert code == (1 if failure == "command_exit" else 2)
+    assert view["outcome"] == "cli_failed"
+    if failure != "command_exit":
+        assert view["issues_total"] == 1

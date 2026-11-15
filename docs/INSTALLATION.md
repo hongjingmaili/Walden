@@ -28,6 +28,6 @@ python3 -m venv "$WALDEN_VENV"
 
 在同一环境调用 `wechat-local-window`，显式传入 `--source-config`，选择一个会话选项（`--contact-query`、`--group-query` 或 `--conversation-username`）。用 `--latest` 查看本地最新 20 条，可按需指定条数。也可用 `--request` 查询明确的时间范围。
 
-默认 `--read-mode local` 只读副本。仅在明确授权同步该来源时使用 `--read-mode refresh`。查看结果时，结合 `coverage`、`synced_at`、`freshness` 和 `gaps` 判断覆盖。遇到重名、来源冲突或不可用的媒体，请按结果补足确认或报告限制。
+默认 `--read-mode local` 只读副本。仅在配置为指定会话范围且明确授权同步该来源时，使用 `--read-mode refresh`。账号范围配置使用 `local` 查询，源同步由已授权的后台服务执行。查看结果时，结合 `coverage`、`synced_at`、`freshness` 和 `gaps` 判断覆盖。遇到重名、来源冲突或不可用的媒体，请按结果补足确认或报告限制。
 
 相关说明：[消息分类规则](WA_MESSAGE_CLASSIFICATION_RULES.md)和[本地语音运行环境](VOICE_RUNTIME.md)。

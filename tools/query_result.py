@@ -37,6 +37,10 @@ DATE_RANGE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})到(\d{4})-(\d{2})-(\d{2})$
 IANA_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+.-]*(/[A-Za-z0-9_+.-]+)+$")
 MESSAGE_PATHS = (("messages",), ("body", "messages"), ("result", "messages"),
                  ("result", "body", "messages"))
+REQUEST_RANGE_PATHS = tuple((*path[:-1], "coverage", "request_range") for path in MESSAGE_PATHS)
+UNPROVEN_RANGE_REASONS = (
+    "observation_evidence_missing", "account_recent_vector_not_proven", "no_recent_range_observation",
+)
 
 WINDOW_SWITCHES = frozenset((*MEDIA_FLAGS, "--json"))
 WINDOW_VALUES = frozenset({
@@ -132,6 +136,11 @@ def private_directory(path):
     return fd
 
 
+def is_private_file(info):
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600)
+
+
 def read_private(path):
     path = absolute(path)
     parent = private_directory(path.parent)
@@ -139,8 +148,7 @@ def read_private(path):
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         with os.fdopen(fd, "rb") as handle:
             before = os.fstat(handle.fileno())
-            require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
-                    and before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600,
+            require(is_private_file(before),
                     "result must be private current-UID regular 0600 with one link")
             data = handle.read()
             after = os.fstat(handle.fileno())
@@ -517,21 +525,31 @@ def analyse(raw, original_exit, spawn_error=None):
         total += 1
         if len(issues) < 20 and len(text.encode("utf-8")) <= 240:
             issues.append(text)
-    def visit(value, path="result"):
+    def visit(value, path="result", location=()):
         if type(value) is dict:
             for key, item in value.items():
                 label = path + "." + key
-                if key in {"status", "body_status"} and type(item) is str and (item in {"failed", "error", "conflict", "incomplete", "unavailable", "not_found", "partial", "pending", "blocked", "unknown", "invalid", "needs_target_copy"}
-                        or item.endswith(("_failed", "_conflict", "_unavailable"))):
-                    issue(label + "=" + item)
+                if key in {"status", "body_status"} and type(item) is str:
+                    fails = (item in {"failed", "error", "conflict", "incomplete", "unavailable",
+                                     "not_found", "partial", "pending", "blocked", "unknown",
+                                     "invalid", "needs_target_copy"}
+                             or item.endswith(("_failed", "_conflict", "_unavailable")))
+                    optional_unknown = key == "status" and item == "unknown" and (
+                        (len(location) >= 4 and location[-2:] == ("source_facts", "mentions")
+                         and type(location[-3]) is int and location[:-3] in MESSAGE_PATHS)
+                        or (location in REQUEST_RANGE_PATHS
+                            and value.get("reason") in UNPROVEN_RANGE_REASONS)
+                    )
+                    if fails and not optional_unknown:
+                        issue(label + "=" + item)
                 if key in {"gaps", "identity_conflicts", "source_conflicts", "identity_conflict", "error", "errors"} and item:
                     issue(label + " is nonempty")
                 if key in {"overflow", "truncated", "has_more"} and item is True:
                     issue(label + "=true")
-                visit(item, label)
+                visit(item, label, (*location, key))
         elif type(value) is list:
             for index, item in enumerate(value):
-                visit(item, path + "[" + str(index) + "]")
+                visit(item, path + "[" + str(index) + "]", (*location, index))
     visit(result)
     if spawn_error:
         issue("CLI could not start: " + spawn_error)
@@ -1054,28 +1072,48 @@ def _page_state_path(result_file):
 
 
 def read_page_state(result_file):
-    """Return (last_served_end, total_messages) from the sidecar, or (None, None). The
-    sidecar is a SEPARATE file from result.json/stdout.bin/stderr.bin, so reading/writing it
-    never touches the read-only captured copy or the live source."""
+    """Read optional pagination state using the capture's private file rules."""
     try:
-        data = json.loads(_page_state_path(result_file).read_text(encoding="utf-8"))
-        v = data.get("last_served_end")
-        t = data.get("total_messages")
-        return (int(v) if type(v) is int else None, int(t) if type(t) is int else None)
-    except Exception:
-        return (None, None)
+        data = parse_json(read_private(_page_state_path(result_file)))
+        if type(data) is dict:
+            end = data.get("last_served_end")
+            total = data.get("total_messages")
+            return (end if type(end) is int else None, total if type(total) is int else None)
+    except (OSError, Refusal, ValueError, RecursionError):
+        pass
+    return (None, None)
+
+
+def page_state_identity(parent, name):
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    require(is_private_file(info), "unsafe pagination state")
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def write_page_state(result_file, end, total_messages):
+    path = _page_state_path(result_file)
     try:
-        p = _page_state_path(result_file)
-        fd = os.open(str(p), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+        parent = private_directory(path.parent)
         try:
-            os.write(fd, json.dumps(dict(last_served_end=int(end),
-                                         total_messages=int(total_messages))).encode("utf-8"))
+            previous = page_state_identity(parent, path.name)
+            temporary = ".walden-page-" + secrets.token_hex(16)
+            handle = exclusive(parent, temporary)
+            try:
+                with handle:
+                    handle.write(encode(dict(last_served_end=end, total_messages=total_messages)))
+                if page_state_identity(parent, path.name) == previous:
+                    # Replace the directory entry itself, even if it changes after the check.
+                    os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                    temporary = None
+            finally:
+                if temporary is not None:
+                    os.unlink(temporary, dir_fd=parent)
         finally:
-            os.close(fd)
-    except Exception:
+            os.close(parent)
+    except (OSError, Refusal):
         pass
 
 

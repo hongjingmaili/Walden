@@ -752,3 +752,56 @@ def test_f_contiguous_sequence_no_false_anomaly(tmp_path, sandbox):
         assert v["page_continuity"]["total_messages_consistent"] is True
     assert "pagination_anomaly" not in v3["coverage"]
     assert v3["end"] == 45 and v3["remaining"] == 0
+
+
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_page_continuity_never_reads_or_overwrites_linked_state(tmp_path, sandbox, link):
+    cli, _, _ = stub(tmp_path, ready(45))
+    record = capture([str(cli)])
+    sidecar = record.with_suffix(".json.page_state")
+    target = tmp_path / "other-private-file"
+    sentinel = b'{"last_served_end": 37, "total_messages": 84}'
+    target.write_bytes(sentinel)
+    target.chmod(0o600)
+    if link == "symlink":
+        sidecar.symlink_to(target)
+    else:
+        os.link(target, sidecar)
+
+    stdout = record.with_name("stdout.bin")
+    original_stdout = stdout.read_bytes()
+    view, _ = q.page(record, 1, 20)
+
+    assert target.read_bytes() == sentinel
+    assert stdout.read_bytes() == original_stdout
+    assert sidecar.samefile(target)
+    assert view["page_continuity"]["previous_end"] is None
+    assert view["page_continuity"]["previous_total_messages"] is None
+    assert view["messages"] == ready(45)["messages"][:20]
+
+
+def test_page_state_replaces_without_truncating_target_substituted_at_publish(tmp_path, sandbox, monkeypatch):
+    cli, _, _ = stub(tmp_path, ready(45))
+    record = capture([str(cli)])
+    _, _ = q.page(record, 1, 20)
+    sidecar = record.with_suffix(".json.page_state")
+    stdout = record.with_name("stdout.bin")
+    original_stdout = stdout.read_bytes()
+    replaced = []
+    original_replace = q.os.replace
+
+    def race(source, destination, **kwargs):
+        assert destination == sidecar.name
+        sidecar.unlink()
+        sidecar.symlink_to(stdout)
+        replaced.append(True)
+        return original_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(q.os, "replace", race)
+    view, _ = q.page(record, 21, 20)
+    assert replaced == [True]
+    assert stdout.read_bytes() == original_stdout
+    assert not sidecar.is_symlink() and stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+    assert q.read_page_state(record) == (40, 45)
+    assert view["page_continuity"]["previous_end"] == 20
+    assert view["page_continuity"]["contiguous"] is True
