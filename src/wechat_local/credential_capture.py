@@ -901,6 +901,14 @@ def _run_preparation_command(step: str, argv: list[str]) -> tuple[bool, str | No
         return False, _safe_diagnostic_text(type(error).__name__ + ': ' + str(error)) or (step + ' failed')
 
 
+def _link_stays_in_bundle(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        return resolved == root or root in resolved.parents
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def _safe_copied_bundle(bundle: Path) -> bool:
     """Never sign a copy containing an external symlink or shared regular file."""
     try:
@@ -915,8 +923,7 @@ def _safe_copied_bundle(bundle: Path) -> bool:
                 path = Path(directory) / name
                 entry = path.lstat()
                 if stat.S_ISLNK(entry.st_mode):
-                    resolved = path.resolve(strict=True)
-                    if resolved != root and root not in resolved.parents:
+                    if not _link_stays_in_bundle(path, root):
                         return False
                 elif stat.S_ISREG(entry.st_mode):
                     if entry.st_nlink != 1:
@@ -926,6 +933,72 @@ def _safe_copied_bundle(bundle: Path) -> bool:
         return True
     except (OSError, ValueError, RuntimeError):
         return False
+
+
+def _remove_copied_signing_attributes(bundle: Path, expected: os.stat_result) -> None:
+    """Remove only codesign-rejected attributes from a previously verified copy."""
+    import ctypes
+    import errno
+
+    if sys.platform != 'darwin':
+        raise OSError(errno.ENOTSUP, 'bundle attribute preparation requires macOS')
+    libc = ctypes.CDLL(None, use_errno=True)
+    get = libc.fgetxattr
+    get.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+                    ctypes.c_uint32, ctypes.c_int)
+    get.restype = ctypes.c_ssize_t
+    remove = libc.fremovexattr
+    remove.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    remove.restype = ctypes.c_int
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    uid = os.getuid()
+
+    def visit(fd: int, before: os.stat_result, path: Path) -> None:
+        actual = os.fstat(fd)
+        directory = stat.S_ISDIR(actual.st_mode)
+        if (not os.path.samestat(before, actual) or actual.st_uid != uid
+                or actual.st_dev != expected.st_dev
+                or (not directory and (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1))):
+            raise OSError(errno.EPERM, 'copied bundle entry is no longer private')
+        for name in (b'com.apple.FinderInfo', b'com.apple.ResourceFork'):
+            if get(fd, name, None, 0, 0, 0) < 0:
+                problem = ctypes.get_errno()
+                if problem != errno.ENOATTR:
+                    raise OSError(problem, 'could not check copied signing attribute')
+            elif remove(fd, name, 0) != 0:
+                raise OSError(ctypes.get_errno(), 'could not remove copied signing attribute')
+
+        if directory:
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    child = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(child.st_mode):
+                        if not _link_stays_in_bundle(path / entry.name, root):
+                            raise OSError(errno.EPERM, 'copied bundle link escapes')
+                        continue
+                    child_flags = flags
+                    if stat.S_ISDIR(child.st_mode):
+                        child_flags |= os.O_DIRECTORY
+                    elif not stat.S_ISREG(child.st_mode):
+                        raise OSError(errno.EPERM, 'copied bundle entry type changed')
+                    child_fd = os.open(entry.name, child_flags, dir_fd=fd)
+                    try:
+                        visit(child_fd, child, path / entry.name)
+                    finally:
+                        os.close(child_fd)
+
+    fd = os.open(bundle, flags | os.O_DIRECTORY)
+    try:
+        try:
+            root = bundle.resolve(strict=True)
+        except RuntimeError:
+            raise OSError(errno.ELOOP, 'copied bundle path contains a link cycle') from None
+        visit(fd, expected, root)
+        if not os.path.samestat(expected, bundle.lstat()):
+            raise OSError(errno.EPERM, 'copied bundle identity changed')
+    finally:
+        os.close(fd)
 
 
 def _file_digest(path: Path) -> str:
@@ -1033,7 +1106,12 @@ def _prepare_reusable_client(root: Path, source: Path) -> tuple[Path | None, str
         bundle = slot / 'WeChat-debug.app'
         ok, error = _run_preparation_command('copy', ['/bin/cp', '-cR', str(source.parents[2]), str(bundle)])
         if not ok: return None, 'preparation_copy_failed', error or 'copy failed'
+        copied_identity = bundle.lstat()
         if not _safe_copied_bundle(bundle): return None, 'preparation_unsafe_bundle', None
+        try:
+            _remove_copied_signing_attributes(bundle, copied_identity)
+        except OSError as error:
+            return None, 'preparation_xattr_failed', f'bundle attribute preparation failed (errno {error.errno})'
         for step, argv in (('sign', ['/usr/bin/codesign', '--force', '--deep', '--sign', '-', '--timestamp=none', str(bundle)]),
                            ('verify', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(bundle)])):
             ok, error = _run_preparation_command(step, argv)
