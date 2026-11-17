@@ -1523,6 +1523,10 @@ def capture_and_save_passphrase(
                 policy_observation['retry'] = 'completed' if status == 'captured_and_verified' else 'failed'
                 second['diagnostics']['policy_observation'] = dict(policy_observation)
                 return second
+            if (evidence['failed_stage'] == 'launch' and evidence['target_exit'] == 'unexpected'
+                    and evidence['target_cleanup'] == 'confirmed'
+                    and evidence['stages']['capture_write'] == 'not_started'):
+                return response(status, failure_reason='target_exited_during_launch')
             return response(status)
         if prepare_copy:
             policy_observation['state'] = 'not_needed'
