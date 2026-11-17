@@ -9,6 +9,6 @@ Walden 在 macOS 上从本机微信读取经过授权的消息，并增量同步
 - 回复兼容功能依赖既存事件证据，发送前仍需确认。新副本的消息引用不能直接用于发送。
 - 今后可探索使用这个副本建立关系记忆。当前版本提供消息同步和查询。
 
-从[安装与配置指南](docs/INSTALLATION.md)开始，或查看[发布说明](RELEASE_NOTES.md)。默认消息分类见[分类规则](docs/WA_MESSAGE_CLASSIFICATION_RULES.md)。本地语音依赖见[语音运行环境](docs/VOICE_RUNTIME.md)。
+从[安装与配置指南](docs/INSTALLATION.md)开始，、[首次取钥排障](docs/FIRST_KEY_TROUBLESHOOTING.md)，或查看[发布说明](RELEASE_NOTES.md)。默认消息分类见[分类规则](docs/WA_MESSAGE_CLASSIFICATION_RULES.md)。本地语音依赖见[语音运行环境](docs/VOICE_RUNTIME.md)。
 
 Walden 使用 [Apache License 2.0](LICENSE)。随附第三方组件适用[各自的许可证](THIRD_PARTY_NOTICES.md)。

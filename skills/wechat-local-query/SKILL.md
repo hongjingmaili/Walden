@@ -59,6 +59,16 @@ For an explicitly authorized daily upgrade, preserve existing account/source-gen
 
 ## First setup, explicit scope and existing copies
 
+### First-capture troubleshooting
+
+For an authorized test alongside an existing daily installation, choose a separate private `--config` and `--data-home`. Keep both paths and the same installed setup environment and authorized account for a retry. The setup may reuse the protected copy registered to that configuration after its existing identity and signature checks. First confirm the previous capture ended and target and debugger cleanup are confirmed. Stop on an identity/source conflict or uncertain cleanup. Do not force reuse.
+
+A system execution denial requires diagnosis for the exact identified private debug copy. The user may choose the system-supported permission for that copy when they recognize and trust it. If the prompt or copy identity is unclear, stop. Do not change global security settings, remove quarantine, or modify the original app. A normal exit of the daily WeChat app requires the user's consent. Do not force quit or delete its lock. After the attempt, reopen the daily app when authorized and have the user confirm login. The user completes any login or scan. Do not request or print credentials.
+
+Treat launch failure and waiting for the user's login as separate stages. Exit 9 alone does not establish Gatekeeper rejection, and exit 255 alone does not establish a lock conflict. A static assessment alone does not establish how a later launch will behave. Record actual evidence and preserve the configuration and copy during a retry.
+
+Claim verified first capture only when the receipt reports `captured_and_verified` and `configured`, with validation, persistence, configuration and target/group cleanup confirmed. A configured profile does not establish mirror initialization or complete history. Follow the configured result and separate source-copy authorization for init.
+
 For a separately authorized new installation, select the explicit single-account root and already-authorized stable username scope. Run the same environment's `wechat-local-setup --account-root <root> --mirror-username <stable> --timezone <known-zone>`; repeat `--mirror-username` for each authorized scope. No implicit whole-account scope, guessed username or discovery of unrelated conversations. With no established scope, report that prerequisite rather than using another source or asking the user to hand-edit JSON.
 
 Setup discovers/validates metadata and writes a private native profile; it does not run a message baseline or create EventStore/AgentStore. On `configured`/`configured_with_voice_incomplete`, report `next_step=init` and separate self/media readiness. Only with source-copy authority run `wechat-local-sync init --source-config <profile>`; `once` continues independent history/tail progress and `status` reports local state. Query local or explicitly refresh afterwards. Configuring scope is not blanket permission for every source/attachment read. An existing bound mirror/profile needs **no reinitialization** for slimming; preserve account/generation, rows/cursors and all private files. Existing optional evidence paths are not migrated, auto-discovered or written.

@@ -38,6 +38,8 @@ python3 -m venv "$WALDEN_VENV"
 
 看到 `configured` 或 `configured_with_voice_incomplete` 后再继续。后者表示配置已完成，语音能力仍有缺口。默认配置路径为 `${XDG_CONFIG_HOME:-$HOME/.config}/wechat-local/current-source.json`。如果显式传了 `--config`，后续使用同一个文件。
 
+已有日常配置时，请先使用独立的 `--config` 和 `--data-home` 路径进行验收，保留日常配置及库。失败重试时保持同一组路径，让程序核验并复用对应的受保护副本。请本人完成登录，不在聊天中提供凭据。详细步骤见[首次取钥排障与复盘](FIRST_KEY_TROUBLESHOOTING.md)。
+
 若出现 `credentials_required`，检查命令是否省略了 `--acquire-passphrase`。若客户端、调试器或验证步骤报错，先根据错误处理当前账号的配置。取钥前提、错误说明和已有同账号凭据的高级导入方式见[随包技能的首次配置说明](../skills/wechat-local-query/SKILL.md#first-setup-explicit-scope-and-existing-copies)。
 
 ### 初始化本地副本
