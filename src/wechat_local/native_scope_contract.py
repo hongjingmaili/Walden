@@ -24,6 +24,8 @@ PENDING='.account-scope.pending'
 CURRENT='.account-scope.current'
 TABLE=re.compile(r'Msg_[0-9a-f]{32}\Z')
 SHARD=re.compile(r'(?:biz_)?message_[0-9]+\.db\Z')
+# Bound both private metadata backups and the owned round's direct status view.
+_REGISTRY_MAX_BYTES = 128 * 1024 * 1024
 
 def digest(value):return sha(encoded(value))
 
@@ -128,7 +130,7 @@ def _safe(path):
 
 def _registry_page_size(conn):
     page_size=conn.execute('PRAGMA page_size').fetchone()[0];pages=conn.execute('PRAGMA page_count').fetchone()[0]
-    need(page_size*pages<=64*1024*1024,'local_registry_snapshot_budget')
+    need(page_size*pages<=_REGISTRY_MAX_BYTES,'local_registry_snapshot_budget')
     return page_size
 
 
@@ -141,7 +143,7 @@ def _registry_snapshot(conn):
     def progress(status,remaining,total):
         if deadline is not None:deadline.check()
         if status in (5,6) and time.monotonic()-started>=.1:raise MirrorError('local_registry_read_busy')
-        need(total*page_size<=64*1024*1024 and time.monotonic()-started<=2.,'local_registry_snapshot_budget')
+        need(total*page_size<=_REGISTRY_MAX_BYTES and time.monotonic()-started<=2.,'local_registry_snapshot_budget')
     try:
         conn.backup(snapshot,pages=64,progress=progress,sleep=0)
         return snapshot

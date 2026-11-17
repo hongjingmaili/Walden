@@ -76,8 +76,8 @@ def test_owned_status_retains_registry_size_cap(item):
     path = Path(item['mirror_root']) / scope.REGISTRY
     with sqlite3.connect(path) as connection:
         connection.execute('CREATE TABLE synthetic_padding(value BLOB)')
-        connection.execute('INSERT INTO synthetic_padding VALUES(zeroblob(?))', (65 * 1024 * 1024,))
-    assert path.stat().st_size > 64 * 1024 * 1024
+        connection.execute('INSERT INTO synthetic_padding VALUES(zeroblob(?))', (129 * 1024 * 1024,))
+    assert path.stat().st_size > 128 * 1024 * 1024
     with pytest.raises(MirrorError, match='local_registry_snapshot_budget'):
         authorized_round(item)
     assert _writer_state(item['config']) == 'free'
