@@ -1,3 +1,3 @@
 """Native local copies for user-authorized WeChat queries."""
 
-__version__ = "0.8"
+__version__ = "0.8.1.dev0"

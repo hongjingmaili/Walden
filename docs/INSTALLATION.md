@@ -42,6 +42,8 @@ python3 -m venv "$WALDEN_VENV"
 
 若出现 `credentials_required`，检查命令是否省略了 `--acquire-passphrase`。若客户端、调试器或验证步骤报错，先根据错误处理当前账号的配置。取钥前提、错误说明和已有同账号凭据的高级导入方式见[随包技能的首次配置说明](../skills/wechat-local-query/SKILL.md#first-setup-explicit-scope-and-existing-copies)。
 
+若状态为 `capture_stage_failed`，且 `failure_reason` 为 `target_exited_during_launch`，说明调试目标在开始捕获前退出。可用诊断中的阶段和退出状态定位此次失败。退出状态本身无法说明是否由 macOS 安全策略拒绝，应核对同一次启动的系统安全事件和调试权限。
+
 ### 初始化本地副本
 
 配置成功后，已授权复制时再执行：
