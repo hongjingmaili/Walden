@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import types
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +21,9 @@ _current = contextvars.ContextVar('failure_task', default=None)
 _KINDS = {'window', 'sync', 'reply', 'setup', 'external'}
 _STAGES = {'entry', 'configuration', 'query', 'synchronize', 'schedule', '[redacted]'}
 _LIMIT = 1024 * 1024
+_RETENTION_COUNT = 200
+_RETENTION_MARKER_LIMIT = 16 * 1024
+_EVIDENCE_NAME = re.compile(r'[0-9a-f]{32}\.json')
 _TYPES = {ValueError: 'ValueError', TypeError: 'TypeError', RuntimeError: 'RuntimeError',
           OSError: 'OSError', PermissionError: 'PermissionError', FileNotFoundError: 'FileNotFoundError',
           KeyboardInterrupt: 'KeyboardInterrupt', SystemExit: 'SystemExit', sqlite3.Error: 'Error',
@@ -104,6 +108,158 @@ def _write(record):
         os.close(directory)
 
 
+def _atomic_evidence(directory, name, raw):
+    temp = uuid.uuid4().hex + '.tmp'
+    out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(out, 'wb') as stream:
+            stream.write(raw);stream.flush();os.fsync(stream.fileno())
+        os.replace(temp,name,src_dir_fd=directory,dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:os.unlink(temp,dir_fd=directory)
+        except FileNotFoundError:pass
+
+
+def _observed_ended(record):
+    from . import native_process
+    from .native_mirror_store import MirrorError
+
+    actor = record.get('process') or {}
+    if type(actor) is not dict:
+        return False
+    start, pid = actor.get('start'), actor.get('pid')
+    if (type(start) is not list or len(start)!=2 or any(type(n) is not int or n<0 for n in start)
+            or type(pid) is not int or pid<=0 or actor.get('uid')!=os.getuid()):
+        return False  # An old PID without a birth cannot prove terminal ownership.
+    try:
+        actual = native_process.identity(pid)
+        if actual is not None and actual.get('start') == start:
+            return False
+        if record['status']=='pending':
+            pgid = actor.get('pgid')
+            if not actor.get('operation_verified') or pgid != pid or native_process.group_members(pgid,actor['uid']):
+                return False
+    except (OSError,MirrorError):
+        return False
+    return True
+
+
+def _recent_retention(directory, now):
+    try:
+        fd = os.open('retention-scan',os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd,'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not _file_safe(info) or not 0 < info.st_size <= _RETENTION_MARKER_LIMIT:
+            return None
+        try:
+            marker = json.loads(stream.read(_RETENTION_MARKER_LIMIT+1))
+        except (ValueError,RecursionError):
+            return None
+    if type(marker) is not dict:
+        return None
+    checked, seen, kept = (marker.get(key) for key in ('checked_at_ns','seen_at_ns','kept'))
+    if (type(checked) is int and type(seen) is int and checked <= seen <= now
+            and now-checked < 60*10**9 and type(kept) is list and len(kept) <= _RETENTION_COUNT
+            and all(type(name) is str and _EVIDENCE_NAME.fullmatch(name) for name in kept)):
+        return marker
+    return None
+
+
+def prune_terminal(*, now_ns=None, throttled=False):
+    """Keep at most 200 terminal records from the last seven days."""
+    try:
+        directory = _directory(create=False)
+    except FileNotFoundError:
+        return 0
+    lock = None
+    try:
+        lock = os.open('.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        if not _file_safe(os.fstat(lock)):
+            raise OSError('unsafe evidence retention lock')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        started = time.time_ns()
+        now = started if now_ns is None else now_ns
+        marker = _recent_retention(directory,started) if throttled else None
+        names = [name for name in os.listdir(directory) if _EVIDENCE_NAME.fullmatch(name)]
+        if marker is not None and len(names) <= _RETENTION_COUNT:
+            return 0
+        previous_kept = set(marker['kept']) if marker is not None else set()
+        cutoff = now - 7*24*60*60*10**9
+        candidates = []
+        for name in names:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if _file_safe(info) and 0 < info.st_size <= _LIMIT:
+                candidates.append((info.st_mtime_ns, name, info.st_ino, info.st_ctime_ns))
+        candidates.sort(reverse=True)
+        kept, retired = [], 0
+        for modified, name, inode, changed in candidates:
+            retain = len(kept) < _RETENTION_COUNT and modified >= cutoff
+            if marker is not None and changed <= marker['seen_at_ns']:
+                # Recent count check. Age and ended-process evidence get a full rescan.
+                if name not in previous_kept:
+                    continue
+                if retain:
+                    kept.append(name)
+                    continue
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not _file_safe(info) or (info.st_ino,info.st_mtime_ns,info.st_ctime_ns)!=(inode,modified,changed):
+                    continue
+                raw = stream.read(_LIMIT+1)
+            if len(raw) > _LIMIT:
+                continue
+            try:
+                record = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            if (type(record) is not dict or record.get('task_id') != name[:-5]
+                    or record.get('schema_version') != 2 or record.get('content_redacted') is not True):
+                continue
+            if record.get('status') in ('started','pending'):
+                if not _observed_ended(record):
+                    continue
+                record['status'] = 'ended'
+                record.setdefault('finished_at',_now())
+                record['terminal_observation'] = 'recorded_process_ended'
+                record.pop('cleanup',None)
+                raw = json.dumps(record).encode()
+                if len(raw)>_LIMIT:
+                    continue
+                current = os.stat(name,dir_fd=directory,follow_symlinks=False)
+                if (current.st_ino,current.st_mtime_ns,current.st_ctime_ns) != (info.st_ino,info.st_mtime_ns,info.st_ctime_ns):
+                    raise OSError('evidence changed during retirement')
+                _atomic_evidence(directory,name,raw)
+                os.utime(name,ns=(modified,modified),dir_fd=directory,follow_symlinks=False)
+                info = os.stat(name,dir_fd=directory,follow_symlinks=False)
+            elif record.get('status') not in ('failed','completed','ended'):
+                continue
+            if retain:
+                kept.append(name)
+                continue
+            # Rotate one protected backup before removing its exact active copy.
+            _atomic_evidence(directory,'retention-last.json',raw)
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if (current.st_ino,current.st_mtime_ns,current.st_ctime_ns) != (info.st_ino,info.st_mtime_ns,info.st_ctime_ns):
+                raise OSError('evidence changed during retirement')
+            os.unlink(name, dir_fd=directory)
+            retired += 1
+        checked = marker['checked_at_ns'] if marker is not None else started
+        _atomic_evidence(directory,'retention-scan',json.dumps(dict(
+            checked_at_ns=checked,seen_at_ns=started,kept=kept,retired=retired)).encode())
+        os.fsync(directory)
+        return retired
+    finally:
+        if lock is not None:os.close(lock)
+        os.close(directory)
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -113,10 +269,25 @@ def begin(kind):
                   kind=kind if kind in _KINDS else 'external', status='started', stage='entry',
                   started_at=_now(), content_redacted=True, missing_events=[],
                    process=dict(pid=os.getpid(),uid=os.getuid(),operation_id=None,operation_verified=False))
+    from . import native_process
+    from .native_mirror_store import MirrorError
+    try:
+        actor = native_process.identity(os.getpid())
+    except (OSError,MirrorError):
+        actor = None
+    if actor:
+        record['process'].update(start=actor['start'],pgid=actor['pgid'])
     token=os.environ.get('WALDEN_OPERATION_ID','')
     if re.fullmatch('[0-9a-f]{32}',token):record['process']['operation_id']=token
     _write(record)
     return record
+
+
+def current_task_id():
+    """Existing CLI evidence identity only; never authority or a new task."""
+    task = _current.get()
+    value = task.get('task_id') if type(task) is dict else None
+    return value if type(value) is str and re.fullmatch('[0-9a-f]{32}', value) else None
 
 
 def _frames(error):
@@ -207,10 +378,39 @@ def phase(name,alias='native'):
     _persist(task,'phase')
 
 
+def round_evidence(value):
+    """Memory-only attachment; normal completion/failure uses existing retention."""
+    task=_current.get()
+    if task is None:return
+    from .native_follow_schedule import round_diagnostics
+    frame=round_diagnostics(dict(round_diagnostics=value))
+    if frame is not None:task['round_diagnostics']=frame
+
+
 _SERVICE_REASONS=frozenset(('observer_unavailable','observer_exception','result_not_dictionary','target_mismatch','result_shape','operation_mismatch'))
 _SERVICE_TYPES={OSError:'OSError',PermissionError:'PermissionError',FileNotFoundError:'FileNotFoundError',
     ValueError:'ValueError',subprocess.SubprocessError:'SubprocessError',subprocess.CalledProcessError:'CalledProcessError',subprocess.TimeoutExpired:'TimeoutExpired'}
 _SERVICE_TYPE_CODES=frozenset(_SERVICE_TYPES.values())|{'none','external_type_redacted'}
+
+
+_WORKER_TERMINAL_REASONS=frozenset(('deadline','requested','failure','source_recovery_complete','directory_probe_complete',
+    'request_window_complete','request_window_pending','unknown'))
+
+
+def bounded_terminal(*,stop_reason,remove_accepted,final_registration,signal_received_before_cleanup,
+                     group_sigterm_sent,group_sigkill_sent,parent_deadline_expired,child_exit,attempts):
+    """Fixed terminal facts, independent of business success or stop proof."""
+    task=_current.get()
+    if task is None:return
+    reason=stop_reason if type(stop_reason) is str and stop_reason in _WORKER_TERMINAL_REASONS else 'unknown'
+    registration=final_registration if type(final_registration) is str and final_registration in ('owned','absent','unknown') else 'unknown'
+    task['worker_terminal']=dict(stop_reason=reason,final_registration=registration,
+        remove_accepted=remove_accepted is True,signal_received_before_cleanup=signal_received_before_cleanup is True,
+        group_sigterm_sent=group_sigterm_sent is True,group_sigkill_sent=group_sigkill_sent is True,
+        parent_deadline_expired=parent_deadline_expired is True,
+        child_exit=child_exit if type(child_exit) is int and -255<=child_exit<=255 else None,
+        attempts=attempts if type(attempts) is int and 0<=attempts<=2147483647 else 0)
+    _persist(task,'worker_terminal')
 
 
 def service_observation_unknown(reason,exception_type=None):
@@ -318,6 +518,10 @@ def boundary(kind):
                 raise
             finally:
                 _current.reset(token)
+                if task is not None and task.get('status') in ('failed','completed','ended'):
+                    try:prune_terminal(throttled=True)
+                    except (OSError,ValueError):
+                        print('failure evidence retention deferred',file=sys.stderr)
         return run
     return decorate
 
@@ -353,7 +557,7 @@ def _validate(record, ident):
         parsed = datetime.fromisoformat(value)
         require(parsed.tzinfo is not None and parsed.isoformat() == value)
     keys(record, ('schema_version', 'task_id', 'kind', 'status', 'stage', 'started_at', 'content_redacted', 'missing_events'),
-         ('stage_at', 'finished_at', 'failure_boundary', 'exceptions', 'exit_code', 'child','process','round_deadline','phase','phase_writes','service_observations','cleanup'))
+         ('stage_at', 'finished_at', 'failure_boundary', 'exceptions', 'exit_code', 'child','process','round_deadline','phase','phase_writes','service_observations','cleanup','terminal_observation','worker_terminal'))
     require(type(record['schema_version']) is int and record['schema_version'] == 2 and record['task_id'] == ident)
     require(record['kind'] in _KINDS and record['status'] in ('started', 'failed', 'completed', 'ended', 'pending'))
     if 'cleanup' in record:
@@ -365,10 +569,23 @@ def _validate(record, ident):
         require('cleanup' in record and 'finished_at' in record)
         require((record.get('process') or {}).get('operation_verified') is True)
     require(record['stage'] in _STAGES and record['content_redacted'] is True)
-    require(type(record['missing_events']) is list and all(x in ('stage', 'child', 'failure', 'final','phase','service_observation') for x in record['missing_events']))
+    require(type(record['missing_events']) is list and all(x in ('stage', 'child', 'failure', 'final','phase','service_observation','worker_terminal') for x in record['missing_events']))
+    if 'terminal_observation' in record:
+        require(record['status']=='ended' and record['terminal_observation']=='recorded_process_ended')
     for name in ('started_at', 'stage_at', 'finished_at'):
         if name in record:
             timestamp(record[name])
+    if 'worker_terminal' in record:
+        require(record['kind']=='sync' and (record.get('process') or {}).get('operation_verified') is True)
+        value=record['worker_terminal']
+        keys(value,('stop_reason','final_registration','remove_accepted','signal_received_before_cleanup',
+                    'group_sigterm_sent','group_sigkill_sent','parent_deadline_expired','child_exit','attempts'))
+        require(type(value['stop_reason']) is str and value['stop_reason'] in _WORKER_TERMINAL_REASONS)
+        require(type(value['final_registration']) is str and value['final_registration'] in ('owned','absent','unknown'))
+        for key in ('remove_accepted','signal_received_before_cleanup','group_sigterm_sent','group_sigkill_sent','parent_deadline_expired'):
+            require(type(value[key]) is bool)
+        require(value['child_exit'] is None or integer(value['child_exit']) and -255<=value['child_exit']<=255)
+        require(integer(value['attempts']) and 0<=value['attempts']<=2147483647)
     if 'service_observations' in record:
         entries=record['service_observations'];require(type(entries) is list and 1<=len(entries)<=8)
         for entry in entries:
@@ -376,10 +593,14 @@ def _validate(record, ident):
             require(entry['reason'] in _SERVICE_REASONS and entry['exception_type'] in _SERVICE_TYPE_CODES)
             require((entry['reason']=='observer_exception')==(entry['exception_type']!='none'))
     if 'process' in record:
-        value=record['process'];keys(value,('pid','uid','operation_id','operation_verified'))
+        value=record['process'];keys(value,('pid','uid','operation_id','operation_verified'),('start','pgid'))
         require(integer(value['pid']) and value['pid']>0 and integer(value['uid']) and value['uid']>=0)
         require(value['operation_id'] is None or type(value['operation_id']) is str and re.fullmatch('[0-9a-f]{32}',value['operation_id']) is not None)
         require(type(value['operation_verified']) is bool and (not value['operation_verified'] or value['operation_id'] is not None))
+        if 'start' in value or 'pgid' in value:
+            require(type(value.get('start')) is list and len(value['start'])==2
+                    and all(integer(n) and n>=0 for n in value['start'])
+                    and integer(value.get('pgid')) and value['pgid']>0)
     if 'round_deadline' in record:
         from .native_deadline import Deadline
         Deadline(record['round_deadline'])
@@ -400,7 +621,7 @@ def _validate(record, ident):
     if 'exceptions' in record:
         # Import fixed entry/request modules to obtain their real code names
         # when lookup runs in a fresh process. No CLI or source operation runs.
-        from . import native_mirror_cli, native_window, native_target_request, native_directory_probe, native_request_media, native_request_record, native_follow, native_follow_grant, native_background, native_scope_contract, native_scope_migrate
+        from . import native_mirror_cli, native_window, native_target_request, native_directory_probe, native_request_media, native_request_record, native_follow, native_follow_grant, native_background, native_scope_contract, native_scope_migrate, native_account_witness
         locations = {(item[1], item[2]) for item in _CODES.values()}
         nodes = record['exceptions']
         require(type(nodes) is list and bool(nodes))
@@ -456,4 +677,4 @@ def main(argv=None):
         return 2
 
 
-_register(_frames, record_failure, capture, error_fields, boundary, console)
+_register(bounded_terminal, _frames, record_failure, capture, error_fields, boundary, console, prune_terminal)

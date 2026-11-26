@@ -323,6 +323,8 @@ def _seed(p,config):
         observations[oid]=observation;anchor=dict(source_identity=observation['source_identity'],header=observation['header'])
         old.need(shard not in anchors or anchors[shard]==anchor,'account_migration_seed_conflict');anchors[shard]=anchor
     with sc.registry(config,write=True,initialize=not path.exists()) as db:
+        from .native_registry_reuse import descriptor
+        old.need(descriptor(config,db) is None,'account_migration_seed_foreign')
         actual={(shard,table):json.loads(proof) for shard,table,proof in db.execute('SELECT shard,table_name,proof FROM members')}
         old.need(all(key in expected and value==expected[key] for key,value in actual.items()),'account_migration_seed_foreign')
         prior_obs={oid:json.loads(proof) for oid,proof in db.execute('SELECT id,proof FROM observations')}

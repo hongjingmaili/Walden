@@ -2,7 +2,7 @@
 
 wheel 包含 Walden 的 Python 程序、查询 Skill、默认分类规则、语音与配置辅助资源及许可证。提供五个命令入口：
 
-- `wechat-local-setup` 配置已授权的本地来源。
+- `wechat-local-setup` 配置已授权的本地来源；显式确认的 `--start-sync --confirmed` 串联取钥验证、副本初始化与持续后台同步。
 - `wechat-local-sync` 管理副本同步和后台服务。
 - `wechat-local-window` 查询副本。
 - `wechat-local-reply` 处理需要既存证据的回复兼容操作。

@@ -11,6 +11,7 @@ import time
 import uuid
 from pathlib import Path
 from .native_deadline import Deadline, activate_deadline, continuous_ns, arm_fatal
+from . import native_media_segment as media_segment
 from .native_mirror_store import MirrorError
 from . import native_process as kernel
 from .failure_evidence import child_result, _register
@@ -111,6 +112,51 @@ def _drain_output(child,buffer):
         else:buffer.clear();buffer.extend(b'!oversize!')
 
 
+def _reap_child(child, output=None):
+    code = child.wait(timeout=.1)
+    if child.stdout is not None:
+        try:
+            if output is not None:
+                _drain_output(child, output)
+        finally:
+            child.stdout.close()
+    return code
+
+
+def _group_children(process, leader):
+    return [member for member in process.group_members(leader['pgid'],leader['uid'])
+            if member['pid'] != leader['pid']]
+
+
+def _kill_and_reap_children(children):
+    # Only unreaped Popen handles created by this worker may be signaled here.
+    for child in children:
+        if child is not None and child.poll() is None:
+            child.kill()
+    for child in children:
+        if child is not None:
+            try:
+                child.wait(timeout=.1)
+            except subprocess.TimeoutExpired:
+                pass  # The caller independently checks the whole owned group.
+
+
+def _update_media_cadence(cadence, runtime, code, output):
+    from .native_follow_schedule import failure_details, plan
+    try:
+        value = json.loads(output)
+    except (ValueError, UnicodeError):
+        value = {}
+    if type(value) is not dict:
+        value = {}
+    detail = failure_details([value.get('failure_reason')]) if code else {}
+    wall, tick = time.time(), continuous_ns()
+    done = dict(operation=runtime['operation'], attempt=runtime['media_attempts'], exit_code=code,
+                completed_at_ns=int(wall*1e9), completed_at_continuous_ns=tick, **detail)
+    return dict(cadence, media=plan(cadence.get('media'), wall=wall, continuous=tick,
+                                    interval=30, completion=done))
+
+
 def _child_error_id(buffer):
     try:value=json.loads(buffer)
     except (ValueError,UnicodeError):return None
@@ -118,42 +164,186 @@ def _child_error_id(buffer):
     return ident if type(ident) is str and re.fullmatch('[0-9a-f]{32}',ident) else None
 
 
+def _round_expiration(attempt, wall, continuous):
+    """Return unknown when the recorded round or its clock ordering is unproven."""
+    try:
+        facts = Deadline(attempt.get('round_deadline')).facts
+    except (MirrorError, OverflowError):
+        return None
+    spawn_wall = attempt.get('spawn_wall_ns')
+    spawn_continuous = attempt.get('spawn_continuous_ns')
+    if (any(type(value) is not int for value in (wall, continuous, spawn_wall, spawn_continuous))
+            or not 0 < spawn_wall <= wall
+            or not facts['continuous_start'] <= spawn_continuous <= continuous):
+        return None
+    return wall / 1e9 >= facts['wall_until'] or continuous >= facts['continuous_until']
+
+
 def _completed_attempt(runtime, code, output=None):
     """Set only after actual exit; count only the existing sync result's scope."""
+    from .native_follow_schedule import SOURCE_CONFLICTS, failure_details, partial_source, partial_media_sources, shard_diagnostics, round_diagnostics
     count = None
     observation = None
     conflicts = []
+    detail = failure_details(()) if code else {}
     if output is not None:
         try:
             value = json.loads(output)
-            allowed = {'source_replaced','auxiliary_source_replaced','source_cursor_regression',
-                       'conversation_identity_conflict','sender_identity_conflict','source_identity_mismatch',
-                       'source_table_missing','source_shard_missing'}
             if type(value.get('gaps')) is list:
-                conflicts = sorted({gap for gap in value['gaps'] if type(gap) is str and gap in allowed})
+                conflicts = sorted({gap for gap in value['gaps'] if type(gap) is str and gap in SOURCE_CONFLICTS})
+            if code or value.get('failure_reason') is not None or value.get('failure_class') is not None or conflicts:
+                detail = failure_details([value.get('failure_reason'), *conflicts])
+            if code:
+                partial=partial_source(value) if code==1 and not conflicts else None
+                if partial is not None:
+                    detail=dict(failure_class='partial_retryable',partial_source=partial)
+                    sources = partial_media_sources(value)
+                    if sources is not None:
+                        detail['media_sources'] = sources
+                        detail['media_source_opens'] = value['source_opens']
+                diagnostics=shard_diagnostics(value)
+                if diagnostics:detail['shard_diagnostics']=diagnostics
+            if 'image_preview_hint' in value:
+                from .native_image_preview import hint
+                preview = hint(value['image_preview_hint'])
+                if preview is not None:
+                    detail['image_preview_hint'] = preview
             candidate = value.get('source_opens')
-            if code == 0 and value.get('gaps') == [] and type(candidate) is int and candidate >= 0:
+            diagnostics=round_diagnostics(value)
+            if diagnostics is not None:detail['round_diagnostics']=diagnostics
+            if (code == 0 and value.get('gaps') == [] and not detail.get('failure_class')
+                    and value.get('source_conflicts') in (None, [])
+                    and value.get('partial_source') is None and value.get('media_sources') is None
+                    and type(candidate) is int and candidate >= 0):
                 count = candidate
                 observation = value.get('follow_observation')
         except (ValueError, UnicodeError, AttributeError):
             pass
-    attempted=runtime.get('attempt_record') or {}
-    ended_wall=time.time_ns();ended_continuous=continuous_ns();facts=attempted.get('round_deadline')
-    expired=bool(facts and (ended_wall>=int(facts['wall_until']*1e9) or ended_continuous>=facts['continuous_until']))
+    attempted = runtime.get('attempt_record')
+    if type(attempted) is not dict:
+        attempted = {}
+    ended_wall = time.time_ns()
+    ended_continuous = continuous_ns()
+    expired = _round_expiration(attempted, ended_wall, ended_continuous)
     raw_signal=-code if type(code) is int and code<0 else None
     termination=dict(raw_signal=raw_signal,round_deadline_expired=expired,clock_basis='parent_reap_observation_not_signal_time',
-        classification=('signal_reaped_at_or_after_round_deadline' if expired else 'signal_reaped_before_round_deadline') if raw_signal else 'exit',
+        classification=(('signal_reaped_at_or_after_round_deadline' if expired else 'signal_reaped_before_round_deadline')
+                        if expired is not None else 'signal_reaped_with_unknown_round_deadline') if raw_signal else 'exit',
         timer_origin='not_independently_proven' if raw_signal else None)
     runtime['last_completed'] = dict(operation=runtime['operation'], attempt=runtime['attempts'],
-        exit_code=code, completed_at_ns=time.time_ns(), completed_at_continuous_ns=continuous_ns(),
+        exit_code=code, completed_at_ns=ended_wall, completed_at_continuous_ns=ended_continuous,
         source_db_connections=count, source_db_connections_scope='sync_once_connection_factory_success_v1',
         observation=observation, source_conflicts=conflicts,child_pid=attempted.get('child_pid'),
-        attempt_record=attempted,termination=termination)
+        attempt_record=attempted,termination=termination,**detail)
+
+
+def _active_media_sources(runtime):
+    """False defers; None is a full success; a mapping limits a verified partial."""
+    from .native_follow_schedule import partial_completion, partial_media_sources
+    done = runtime.get('last_completed')
+    attempt = runtime.get('attempt_record')
+    if type(done) is not dict or type(attempt) is not dict:
+        return False
+    termination = done.get('termination')
+    code = runtime.get('child_exit')
+    operation = runtime.get('operation')
+    number = runtime.get('attempts')
+    if (type(termination) is not dict or runtime.get('admission_failure')
+            or type(code) is not int or type(done.get('exit_code')) is not int or done['exit_code'] != code
+            or type(operation) is not str or not operation or type(number) is not int or number <= 0
+            or done.get('operation') != operation or type(done.get('attempt')) is not int or done['attempt'] != number
+            or attempt.get('operation') != operation or type(attempt.get('attempt')) is not int or attempt['attempt'] != number
+            or attempt != done.get('attempt_record') or attempt.get('phase') != 'spawned'
+            or type(attempt.get('child_pid')) is not int or attempt['child_pid'] <= 0
+            or type(done.get('child_pid')) is not int or type(runtime.get('child_pid')) is not int
+            or attempt['child_pid'] != done['child_pid'] or attempt['child_pid'] != runtime['child_pid']
+            or done.get('source_conflicts') != [] or 'raw_signal' not in termination or termination['raw_signal'] is not None
+            or termination.get('round_deadline_expired') is not False
+            or _round_expiration(attempt, done.get('completed_at_ns'), done.get('completed_at_continuous_ns')) is not False):
+        return False
+    if code == 0:
+        opens = done.get('source_db_connections')
+        return None if (type(opens) is int and opens > 0
+                        and done.get('source_db_connections_scope') == 'sync_once_connection_factory_success_v1'
+                        and done.get('failure_class') is None and done.get('failure_reason') is None) else False
+    if not partial_completion(done):
+        return False
+    partial = done['partial_source']
+    gaps = []
+    if partial['retrying_shards']:
+        gaps.append('source_shard_retry_pending')
+    if 'paused_tables' in partial:
+        from .native_table_cursor import PENDING
+        gaps.append(PENDING)
+    return partial_media_sources(dict(done, gaps=gaps, source_opens=done.get('media_source_opens'))) or False
+
+
+def _preview_reference(runtime):
+    from .native_image_preview import hint
+    options = _active_media_sources(runtime)
+    if options is False:
+        return None
+    ref = hint(runtime['last_completed'].get('image_preview_hint'))
+    if ref is None or options is not None and options.get(ref['shard'])!=ref['anchor']:
+        return None
+    return ref
+
+
+def _preview_deadline(cadence, runtime, parent, interval, wall, tick):
+    """Fit between ordinary admissions, including the earliest dirty idle poll."""
+    from .native_image_preview import MAX_AGE, MAX_SECONDS
+    media = cadence.get('media')
+    done = runtime.get('last_completed')
+    checked = done.get('completed_at_continuous_ns') if type(done) is dict else None
+    if (cadence.get('mode') not in ('normal','idle') or cadence.get('due') is not False
+            or type(media) is not dict or media.get('mode')!='normal' or media.get('last_completion') is None
+            or type(checked) is not int or not 0<=tick-checked<=MAX_AGE*10**9):
+        return None
+    required = [cadence.get('next_due_at_ns'),cadence.get('next_due_continuous_ns'),
+                media.get('next_due_at_ns'),media.get('next_due_continuous_ns')]
+    if cadence['mode']=='idle':
+        required += [cadence.get('last_checked_at_ns'),cadence.get('last_checked_continuous_ns')]
+    if any(type(value) is not int or value <= 0 for value in required):
+        return None
+    source_wall, source_tick = required[:2]
+    if cadence['mode']=='idle':
+        source_wall = min(source_wall,cadence['last_checked_at_ns']+interval*10**9)
+        source_tick = min(source_tick,cadence['last_checked_continuous_ns']+interval*10**9)
+    # Leave time for parent polling/reaping before the first regular deadline.
+    margin = 2*10**9
+    wall_end = min(parent['wall_until'], wall/1e9+MAX_SECONDS,
+                   (source_wall-margin)/1e9,(media['next_due_at_ns']-margin)/1e9)
+    tick_end = min(parent['continuous_until'],tick+MAX_SECONDS*10**9,
+                   source_tick-margin,media['next_due_continuous_ns']-margin)
+    if wall_end-wall/1e9<4 or tick_end-tick<4*10**9:
+        return None
+    return dict(wall_until=wall_end,continuous_start=tick,continuous_until=tick_end)
+
+
+def _record_preview_exit(runtime, code, buffer):
+    plan = runtime.pop('early_preview_plan')
+    result = dict(attempt=plan['attempt'],started_at_ns=plan['started_at_ns'],reaped_at_ns=time.time_ns(),exit_code=code,
+                  deadline=plan['deadline'])
+    try:
+        parsed = json.loads(buffer)
+        for name in ('preview_attempted','preview_published','resource_opens','preview_started_at_ns','preview_published_at_ns'):
+            if type(parsed.get(name)) is int:
+                result[name]=parsed[name]
+        reason=parsed.get('preview_reason')
+        if type(reason) is str and re.fullmatch('[a-z_]{1,64}',reason):
+            result['reason']=reason
+    except (ValueError,AttributeError):
+        pass
+    runtime['last_early_preview']=result
 
 
 def _idle_delay(deadline, cadence, next_run, poll):
     if cadence is None:
         due = next_run-time.monotonic()
+    elif cadence['mode'] == 'blocked':
+        due = poll
+    elif cadence['mode'] == 'backoff':
+        due = (cadence['next_due_continuous_ns']-continuous_ns())/1e9
     else:
         due = min((cadence['next_due_at_ns']-time.time_ns())/1e9,
                   (cadence['next_due_continuous_ns']-continuous_ns())/1e9)
@@ -262,7 +452,31 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
     runtime=dict(operation=record['operation'],os_context=record['os_context'],leader=leader,
                  status='running',attempts=0,child_exit=None,deadline=record['deadline'],group_drained=False,registration_absent=False)
     stop=[False];previous=signal.getsignal(signal.SIGTERM)
-    child=None;media_child=None;media_next=0.;failure=None;output=bytearray();remove_accepted=False
+    child=None;media_child=None;media_early=False;media_preempted=False;preview_seen=0;media_next=0.;failure=None;output=bytearray();media_output=bytearray();remove_accepted=False
+    group_sigterm_sent=False;group_sigkill_sent=False;signal_before_cleanup=False
+    reap_pending = False
+    def finish_regular_media(child_process, code, buffer, *, cleaning=False):
+        nonlocal cadence
+        plan = runtime.pop('media_segment_plan', None)
+        proof = media_segment.verified(plan, child_process.pid, code, buffer,
+                                       wall=time.time_ns(), tick=continuous_ns()) if plan else None
+        if proof is not None:
+            runtime['media_child_exit'] = code
+            runtime['media_segment_yield'] = dict(proof, attempt=plan['attempt'], deadline=plan['child_deadline'])
+            return
+        _record_media_exit(runtime, code)
+        if follow is not None and follow['kind']=='active' and (not cleaning
+                or code not in (-signal.SIGTERM,-signal.SIGKILL)):
+            cadence = _update_media_cadence(cadence, runtime, code, buffer)
+            runtime['source_schedule'] = cadence
+
+    def preempt_preview():
+        nonlocal media_preempted
+        if not media_preempted:
+            media_preempted = True
+            try:media_child.kill()
+            except ProcessLookupError:pass
+
     def persist_cleanup():
         nonlocal failure
         try:_runtime_write(runtime_path,runtime)
@@ -301,8 +515,18 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
             if follow is not None and follow['kind'] in ('active','drain'):
                 deadline.check_revocation(process=process)
             if _config_digest(config_path)!=record['config_sha256']:raise MirrorError('schedule_configuration_conflict')
+            if media_child is not None:
+                _drain_output(media_child, media_output)
             if media_child is not None and media_child.poll() is not None:
-                _record_media_exit(runtime,media_child.returncode);media_child=None
+                media_code = _reap_child(media_child, media_output)
+                if media_early:
+                    _record_preview_exit(runtime, media_code, media_output)
+                    media_early = False
+                else:
+                    finish_regular_media(media_child, media_code, media_output)
+                media_child = None
+                media_preempted = False
+                reap_pending = True
                 _runtime_write(runtime_path,runtime)
                 if follow is not None and follow['kind']=='request' and runtime.get('request_source_complete'):
                     if runtime['media_child_exit']!=0:raise MirrorError('request_media_child_failed')
@@ -312,9 +536,10 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
                 _drain_output(child,output)
                 code=child.poll()
                 if code is not None:
-                    _drain_output(child,output)
+                    code = _reap_child(child, output)
                     runtime['child_error_id']=_child_error_id(output)
                     runtime['child_exit']=code;child_result(code,None);child=None
+                    reap_pending = True
                     _completed_attempt(runtime,code,output)
                     if follow is not None:
                         done=runtime['last_completed'];observation=done.get('observation') or {}
@@ -326,7 +551,7 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
                                      completion=completion,draining=follow['kind']=='drain')
                         runtime['source_schedule']=cadence
                     _runtime_write(runtime_path,runtime)
-                    if code:raise MirrorError('schedule_child_failed')
+                    if code and runtime['last_completed'].get('failure_class')!='partial_retryable':raise MirrorError('schedule_child_failed')
                     if follow is not None and follow['kind']=='source_recovery':
                         try:recovery_response=json.loads(output)
                         except (ValueError,AttributeError):recovery_response={}
@@ -352,6 +577,10 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
                             runtime['request_terminal_pending']=response.get('request_terminal_pending') is True
                             break
                     next_run=time.monotonic()+interval
+            if reap_pending and child is None and media_child is None:
+                if _group_children(process, leader):
+                    raise MirrorError('owned_descendants_unsettled')
+                reap_pending = False
             ready=time.monotonic()>=next_run
             parent_hint=consumed_hint
             if follow is not None and child is None:
@@ -363,7 +592,11 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
                     cadence=newer;runtime['source_schedule']=cadence;_runtime_write(runtime_path,runtime)
                 ready=cadence['due']
             active_tail = follow is not None and follow['kind']=='active' and deadline.remaining()<follow['round_seconds']
-            if child is None and ready and not active_tail and not runtime.get('request_source_complete'):
+            if child is None and ready and media_early and media_child is not None:
+                # A clock/hint change can make Source due sooner than planned.
+                # Stop this optional child without waiting before normal Source.
+                preempt_preview()
+            if child is None and ready and not reap_pending and not active_tail and not runtime.get('request_source_complete'):
                 deadline.check()
                 if _config_digest(config_path)!=record['config_sha256']:raise MirrorError('schedule_configuration_conflict')
                 # Recheck immediately before spawn, including after a system sleep.
@@ -380,11 +613,30 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
                     args += ['--round-deadline',json.dumps(facts,sort_keys=True)]
                     attempt_hint=parent_hint
                     extra['env']=dict(payload['EnvironmentVariables'])
+                    if follow['kind'] in ('active','drain'):
+                        extra['env']['WALDEN_FOLLOW_CONTROL_RESULT'] = '1'
                 runtime['attempt_record']=dict(operation=runtime['operation'],attempt=runtime['attempts']+1,
                     round_deadline=dict(facts),spawn_wall_ns=time.time_ns(),spawn_continuous_ns=continuous_ns(),
                     phase='spawning',child_pid=None,child_identity=None)
                 _runtime_write(runtime_path,runtime)
-                child=spawn(args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,close_fds=True,**extra)
+                try:
+                    child=spawn(args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,close_fds=True,**extra)
+                except (OSError,subprocess.SubprocessError) as error:
+                    from .native_follow_schedule import failure_details
+                    unavailable = isinstance(error,(FileNotFoundError,PermissionError))
+                    detail = failure_details(['source_runner_unavailable'] if unavailable else [])
+                    runtime['attempts'] += 1
+                    runtime['attempt_record']['phase'] = 'spawn_failed'
+                    runtime['admission_failure'] = dict(operation=runtime['operation'],attempt=runtime['attempts'],
+                        kind='source_spawn',completed_at_ns=time.time_ns(),
+                        completed_at_continuous_ns=continuous_ns(),**detail)
+                    if cadence is not None:
+                        outcome = dict(runtime['admission_failure'],exit_code=2)
+                        cadence = plan(cadence,wall=time.time(),continuous=continuous_ns(),interval=interval,
+                                       completion=outcome,draining=follow['kind']=='drain')
+                        runtime['source_schedule'] = cadence
+                    _runtime_write(runtime_path,runtime)
+                    raise MirrorError('schedule_child_spawn_failed') from error
                 runtime['attempt_record'].update(phase='spawned',child_pid=child.pid)
                 try:
                     identity=process.identity(child.pid)
@@ -399,31 +651,98 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
             # No media starts in drain; expensive codecs/ASR never occupy the message child.
             media_configured=bool(follow is not None and (config.get('voice_databases') or config.get('image_database') or
                                   config.get('mirror_root') and (Path(config['mirror_root'])/'media-work.sqlite').is_file()))
-            if (follow is not None and (follow['kind']=='active' or follow['kind']=='request' and runtime.get('request_source_complete')) and media_configured and media_child is None
-                    and runtime.get('child_exit')==0 and time.monotonic()>=media_next and deadline.remaining()>2 and not stop[0]):
+            media_ready = time.monotonic() >= media_next
+            if media_configured and follow['kind'] == 'active' and cadence.get('media'):
+                media_ready = plan(cadence['media'],wall=time.time(),continuous=continuous_ns(),interval=30)['due']
+            media_source_ready = (follow is not None and
+                (_active_media_sources(runtime) is not False if follow['kind']=='active' else
+                 follow['kind']=='request' and runtime.get('request_source_complete') and runtime.get('child_exit')==0))
+            if media_ready and media_early and media_child is not None:
+                preempt_preview()
+                if media_child.poll() is not None:
+                    continue  # Reap through the same slot before any idle wait.
+            ordinary_ready = (media_source_ready and media_configured and media_child is None
+                              and media_ready and not reap_pending and not stop[0]
+                              and not runtime.get('media_segment_yield'))
+            remaining = deadline.remaining()
+            min_start = (media_segment.CLEANUP_SECONDS+media_segment.STAGE_SECONDS['claim']
+                         if follow is not None and follow['kind']=='active' else 2)
+            if ordinary_ready and remaining<=min_start and min_start>2 and not runtime.get('media_segment_deferred'):
+                runtime['media_segment_deferred'] = dict(remaining_seconds=remaining, at_ns=time.time_ns())
+                _runtime_write(runtime_path,runtime)
+            if ordinary_ready and remaining>min_start:
                 tick=continuous_ns();facts=dict(deadline.facts)
                 facts.update(continuous_start=tick,continuous_until=min(facts['continuous_until'],tick+120000000000),
                              wall_until=min(facts['wall_until'],time.time()+120))
                 media_args=[payload['ProgramArguments'][0],'media','--source-config',str(config_path),
                     '--operation-record',str(record_path),'--operation-token',record['operation'],'--round-deadline',json.dumps(facts,sort_keys=True)]
                 media_next=time.monotonic()+30
+                preview_seen=runtime['attempts']  # A normal admission already won this turn.
+                media_output = bytearray()
+                runtime['media_attempts'] = runtime.get('media_attempts', 0) + 1
+                if follow['kind']=='active' and media_segment.segment_limited(deadline.facts, facts):
+                    token = uuid.uuid4().hex
+                    runtime['media_segment_plan'] = dict(
+                        token=token, operation=record['operation'], grant_sha256=record['follow_grant_sha256'],
+                        attempt=runtime['media_attempts'], child_deadline=facts, started_wall_ns=time.time_ns())
+                    media_args.extend(('--media-segment-token', token))
+                    _runtime_write(runtime_path,runtime)
                 try:
-                    media_child=spawn(media_args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                                      close_fds=True,env=dict(payload['EnvironmentVariables']))
+                    media_child=spawn(media_args,stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE if follow['kind']=='active' else subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, close_fds=True,env=dict(payload['EnvironmentVariables']))
+                    if media_child.stdout is not None:
+                        os.set_blocking(media_child.stdout.fileno(), False)
                     runtime['media_child_pid']=media_child.pid;runtime['media_error']=None
                 except (OSError,subprocess.SubprocessError):
+                    runtime.pop('media_segment_plan', None)
                     runtime['media_error']='media_spawn_unavailable';runtime['media_failure_seen']=True
                     if follow['kind']=='request':raise MirrorError('request_media_spawn_unavailable')
+                    cadence = _update_media_cadence(cadence, runtime, 1, media_output)
+                    runtime['source_schedule'] = cadence
                 _runtime_write(runtime_path,runtime)
+            if (follow is not None and follow['kind']=='active' and not active_tail
+                    and child is None and media_child is None and not reap_pending and not stop[0]
+                    and not ready and not media_ready and runtime['attempts']>preview_seen):
+                preview_seen=runtime['attempts']
+                if (media_source_ready and owner and owner.get('admission') is True
+                        and not (owner.get('retirement_pending') or owner.get('unsettled_activity'))
+                        and _preview_reference(runtime) is not None):
+                    facts = _preview_deadline(cadence,runtime,deadline.facts,interval,time.time_ns(),continuous_ns())
+                    if facts is not None:
+                        media_args=[payload['ProgramArguments'][0],'media','--source-config',str(config_path),
+                            '--operation-record',str(record_path),'--operation-token',record['operation'],
+                            '--round-deadline',json.dumps(facts,sort_keys=True),'--early-preview']
+                        media_output=bytearray()
+                        runtime['early_preview_plan']=dict(attempt=preview_seen,deadline=facts,started_at_ns=time.time_ns())
+                        _runtime_write(runtime_path,runtime)
+                        try:
+                            media_child=spawn(media_args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                                              stderr=subprocess.DEVNULL,close_fds=True,env=dict(payload['EnvironmentVariables']))
+                        except (OSError,subprocess.SubprocessError):
+                            _record_preview_exit(runtime,2,b'{"preview_reason":"preview_spawn_unavailable"}')
+                            _runtime_write(runtime_path,runtime)
+                        else:
+                            media_early=True
+                            if media_child.stdout is not None:
+                                os.set_blocking(media_child.stdout.fileno(),False)
             if child is None:
-                delay=min(1.,deadline.remaining()) if active_tail or runtime.get('request_source_complete') else _idle_delay(deadline,cadence,next_run,idle_poll)
-                _idle_wait(read_fd,min(delay,2.) if media_child is not None else delay,sleep)
+                if reap_pending or active_tail or runtime.get('request_source_complete'):
+                    delay = min(1.,deadline.remaining())
+                else:
+                    delay = _idle_delay(deadline,cadence,next_run,idle_poll)
+                if media_preempted:
+                    delay = min(delay,.05)
+                elif media_child is not None:
+                    delay = min(delay,2.)
+                _idle_wait(read_fd,delay,sleep)
             else:
                 sleep(min(0.05,deadline.remaining()))
     except BaseException as error:
         failure=error
     finally:
         try:
+            signal_before_cleanup=stop[0]
             runtime['status']='stopping';runtime['stop_reason']='failure' if failure else 'requested' if stop[0] else 'source_recovery_complete' if runtime.get('source_recovery_complete') else 'directory_probe_complete' if runtime.get('directory_probe_complete') else 'request_window_complete' if runtime.get('request_complete') else 'request_window_pending' if runtime.get('request_terminal_pending') else 'deadline'
             persist_cleanup()
             # Unregister first: this one-shot job has no KeepAlive/StartInterval, and
@@ -435,35 +754,51 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
             except (OSError,MirrorError,ValueError,subprocess.SubprocessError) as error:
                 if isinstance(error,subprocess.CalledProcessError):child_result(error.returncode,error.stderr)
                 runtime['registration_absent']=False
-            members=[v for v in process.group_members(leader['pgid'],leader['uid']) if v['pid']!=leader['pid']]
+            members = _group_children(process, leader)
             if members:
                 process.signal_own_group(leader,signal.SIGTERM)
+                group_sigterm_sent=True
                 grace=continuous_ns()+2000000000
                 while members and continuous_ns()<grace:
                     if child is not None:child.poll()
                     if media_child is not None:media_child.poll()
                     sleep(0.02)
-                    members=[v for v in process.group_members(leader['pgid'],leader['uid']) if v['pid']!=leader['pid']]
+                    members = _group_children(process, leader)
+                if members:
+                    _kill_and_reap_children((child, media_child))
+                    members = _group_children(process, leader)
                 if members:
                     runtime['status']='forcing_group_exit';persist_cleanup()
                     # Last resort includes the live owned leader, so no descendant is
                     # orphaned into a different group and no fictitious final is saved.
+                    group_sigkill_sent=True
                     process.signal_own_group(leader,signal.SIGKILL)
                     raise MirrorError('schedule_process_unknown')
             if child is not None:
-                runtime['child_exit']=child.wait(timeout=0.1)
-                _drain_output(child,output);runtime['child_error_id']=_child_error_id(output)
+                runtime['child_exit']=_reap_child(child, output)
+                runtime['child_error_id']=_child_error_id(output)
                 _completed_attempt(runtime,runtime['child_exit'],output)
                 child_result(runtime['child_exit'],None)
             if media_child is not None:
-                _record_media_exit(runtime,media_child.wait(timeout=0.1))
+                media_code = _reap_child(media_child, media_output)
+                if media_early:
+                    _record_preview_exit(runtime, media_code, media_output)
+                else:
+                    finish_regular_media(media_child, media_code, media_output, cleaning=True)
             runtime['group_drained']=True
             final_observation=_observe(transport,record['target'],payload)
             runtime['registration_absent']=final_observation=='absent'
             runtime['cleanup_observation']=dict(remove_accepted=remove_accepted,registration=final_observation)
+            from .failure_evidence import bounded_terminal
+            bounded_terminal(stop_reason=runtime['stop_reason'],remove_accepted=remove_accepted,final_registration=final_observation,
+                signal_received_before_cleanup=signal_before_cleanup,group_sigterm_sent=group_sigterm_sent,group_sigkill_sent=group_sigkill_sent,
+                parent_deadline_expired=deadline.remaining()<=0,child_exit=runtime.get('child_exit'),attempts=runtime['attempts'])
             runtime['status']='stopped' if runtime['registration_absent'] else 'stop_unconfirmed'
-            body_ok=runtime.get('child_exit')==0 and runtime.get('media_child_exit') in (None,0) and runtime.get('media_error') is None and runtime.get('media_failure_seen') is not True
-            if (failure is None and body_ok and not stop[0] and follow is not None and follow.get('kind')=='active'
+            media_failed = runtime.get('media_child_exit') not in (None,0) or runtime.get('media_error') or runtime.get('media_failure_seen') is True
+            body_ok = runtime.get('child_exit') == 0 and (follow is not None and follow['kind']=='active' or not media_failed)
+            # Self-removal can deliver SIGTERM. The saved cause precedes it.
+            # The receiver still has to prove intent, ownership, and final stop.
+            if (failure is None and body_ok and runtime['stop_reason']=='deadline' and follow is not None and follow.get('kind')=='active'
                 and remove_accepted and final_observation=='owned'):
                 _verify_cleanup_owner(config,config_path,record_path,record,payload,follow,transport,process,leader)
                 runtime['status']='cleanup_pending'
@@ -474,14 +809,14 @@ def run_bounded(config,config_path,record_path,*,operation_token=None,transport=
             os.close(read_fd);os.close(write_fd)
     if failure:raise failure
     if runtime.get('child_exit') not in (None,0):raise MirrorError('schedule_child_failed')
-    if runtime.get('media_child_exit') not in (None,0) or runtime.get('media_error') or runtime.get('media_failure_seen') is True:raise MirrorError('schedule_media_child_failed')
+    if (follow is None or follow['kind']!='active') and media_failed:raise MirrorError('schedule_media_child_failed')
     if runtime['status']=='cleanup_pending':
         return CleanupPending(status='cleanup_pending',enabled=False,stopped=False,registration_absent=False,source_authority=False,body_status='succeeded',operation=record['operation'],handoff=dict(created_at_ns=runtime['cleanup_pending']['created_at_ns'],expires=runtime['cleanup_pending']['expires'],source_authority=False))
     if not runtime['registration_absent']:raise MirrorError('schedule_state_unknown')
     return dict(enabled=False,stopped=True,deadline_expired=runtime['stop_reason']=='deadline',attempts=runtime['attempts'])
 
 
-def run_owned_once(config,config_path,record_path,action,*,operation_token=None,transport=None,process=kernel,round_deadline=None,follow_action=None,owned_media=False,request_media_devices=None):
+def run_owned_once(config,config_path,record_path,action,*,operation_token=None,transport=None,process=kernel,round_deadline=None,follow_action=None,owned_media=False,request_media_devices=None,early_preview=None,media_segment_token=None):
     from .native_schedule import LaunchctlTransport,_read
     record_path=Path(record_path).absolute()
     parent_deadline=Deadline(json.loads(_read(record_path)[0]).get('deadline'))
@@ -513,7 +848,62 @@ def run_owned_once(config,config_path,record_path,action,*,operation_token=None,
     bind_operation(record['operation'],deadline.facts);phase('owned_control')
     with activate_deadline(deadline):
         deadline.check()
-        if record.get('follow_grant') and role.get('kind')=='request' and owned_media:
+        plan = None
+        if media_segment_token is not None:
+            if (not record.get('follow_grant') or role.get('kind')!='active'
+                    or not owned_media or early_preview is not None):
+                raise MirrorError('media_segment_binding')
+            plan = media_segment.bind(runtime.get('media_segment_plan'), media_segment_token,
+                                      record, runtime, round_deadline)
+        if early_preview is not None:
+            from .native_follow_policy import Store
+            from .native_image_preview import MAX_SECONDS
+            plan = runtime.get('early_preview_plan') or {}
+            ref = _preview_reference(runtime)
+            if (not record.get('follow_grant') or role.get('kind')!='active' or not owned_media or ref is None
+                    or plan.get('attempt')!=runtime.get('attempts') or plan.get('deadline')!=round_deadline
+                    or round_deadline is None or round_deadline['continuous_until']-round_deadline['continuous_start']>MAX_SECONDS*10**9):
+                raise MirrorError('media_source_round_changed')
+            def validate_preview():
+                deadline.check()
+                live = json.loads(_read(record_path.with_suffix('.runtime'))[0])
+                owner = Store(role['store_root']).read('instance.'+role['instance_nonce']+'.json')
+                if (live.get('operation')!=record['operation'] or live.get('status')!='running'
+                        or live.get('early_preview_plan')!=plan or _preview_reference(live)!=ref
+                        or live.get('last_completed')!=runtime['last_completed']
+                        or not owner or owner.get('admission') is not True
+                        or owner.get('retirement_pending') or owner.get('unsettled_activity')):
+                    raise MirrorError('media_source_round_changed')
+            result = early_preview(ref,validate=validate_preview)
+        elif record.get('follow_grant') and role.get('kind')=='active' and owned_media:
+            sources = _active_media_sources(runtime)
+            if sources is False:
+                result = dict(gaps=[], media_dispatch_reason='source_round_pending', media_attempted=0)
+            else:
+                def current_media_source(shard):
+                    deadline.check()
+                    live = json.loads(_read(record_path.with_suffix('.runtime'))[0])
+                    if live.get('operation')!=record['operation'] or live.get('status')!='running' or live.get('admission_failure'):
+                        raise MirrorError('media_source_round_changed')
+                    if live.get('last_completed') == runtime['last_completed']:
+                        return True
+                    latest = _active_media_sources(live)
+                    if latest is False:
+                        raise MirrorError('media_source_round_changed')
+                    return latest is None or latest.get(shard)==sources.get(shard)
+                media_options = dict(media_sources=sources,media_validate=current_media_source) if sources is not None else {}
+                try:
+                    with media_segment.activate(plan):
+                        result = (follow_action or action)(**media_options)
+                except media_segment.SegmentYield as yielded:
+                    deadline.check()
+                    live=json.loads(_read(record_path.with_suffix('.runtime'))[0])
+                    if (not plan or live.get('operation')!=record['operation'] or live.get('status')!='running'
+                            or live.get('media_segment_plan')!=plan or live.get('leader')!=runtime['leader']
+                            or not process.same_generation(process.identity(runtime['leader']['pid']),runtime['leader'])):
+                        raise MirrorError('media_segment_binding') from None
+                    result=media_segment.receipt(plan, os.getpid(), yielded)
+        elif record.get('follow_grant') and role.get('kind')=='request' and owned_media:
             if round_deadline is None or round_deadline['continuous_until']-round_deadline['continuous_start']>120000000000:raise MirrorError('request_budget_invalid')
             from .native_request_media import run
             result=run(config,record_path,**(request_media_devices or {}))
@@ -529,4 +919,4 @@ def run_owned_once(config,config_path,record_path,action,*,operation_token=None,
         return result
 
 
-_register(_record_media_exit,_cleanup_grant_metadata,cleanup_handoff_status,_verify_cleanup_owner,bootstrap,starting_leader,_control,_runtime_write,_drain_output,_child_error_id,_completed_attempt,_idle_delay,_idle_wait,run_bounded,run_owned_once)
+_register(_reap_child,_group_children,_kill_and_reap_children,_update_media_cadence,_record_media_exit,_cleanup_grant_metadata,cleanup_handoff_status,_verify_cleanup_owner,bootstrap,starting_leader,_control,_runtime_write,_drain_output,_child_error_id,_completed_attempt,_idle_delay,_idle_wait,run_bounded,run_owned_once)

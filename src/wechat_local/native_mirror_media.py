@@ -3,37 +3,90 @@ import hashlib
 import os
 import sqlite3
 import stat
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .common import quote_identifier as qi
 from .native_deadline import check_deadline
+from .native_mirror_store import MirrorError
 from .image_runtime import ImageMessageIdentity, ImageUnavailable, _bound_file, _resource_facts
 import json
 
 
-def frozen_message(config, root, current):
+class MediaItemDeferred(MirrorError):
+    """An individual committed job is stale or currently suspended."""
+
+
+def frozen_message(config, root, current, *, expected_anchor=None, local_only=False):
+    # Local repair supplies an anchor from the protected local registry and
+    # checks the committed copy against it without touching the Source file.
     from .source_records import RawMessage, _content_fingerprint
     source = current['source']
+    from .native_scope_contract import mode, registry, member, _safe
+    account = mode(config) == 'account'
+    item_error = MediaItemDeferred if expected_anchor is not None else MirrorError
+    if 'table_generation' in source:
+        raise item_error('cursor_generation_media_unavailable')
+    if expected_anchor is not None and (
+            source.get('account_id') != config['account_id'] or source.get('source_generation') != config['source_generation']):
+        raise item_error('media_job_stale')
+    if account:
+        from .native_table_cursor import pending
+        with registry(config, snapshot=expected_anchor is None) as index:
+            if pending(index, source['shard'], source['table']) is not None:
+                raise item_error('cursor_generation_media_unavailable')
+            if expected_anchor is not None:
+                proof = member(config, index, source['shard'], source['table'])
+                if {k: proof[k] for k in expected_anchor} != expected_anchor:
+                    raise MirrorError('scope_source_conflict')
+                if proof.get('supported') is not True or proof.get('available') is not True or proof.get('username') != current.get('media_username'):
+                    raise item_error('media_job_stale')
     path = root / source['shard']
-    with sqlite3.connect(readonly_database_uri(path), uri=True) as connection:
+    if expected_anchor is not None:
+        _safe(path)
+    if expected_anchor is not None and not local_only:
+        physical = Path(config['message_root']) / source['shard']
+        try:
+            with os.fdopen(os.open(physical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+                node = os.fstat(stream.fileno())
+                if not stat.S_ISREG(node.st_mode) or [node.st_dev,node.st_ino] != expected_anchor['source_identity']:
+                    raise MirrorError('source_replaced')
+                header = hashlib.sha256(stream.read(16)).hexdigest()
+                live = physical.lstat()
+                if [live.st_dev,live.st_ino] != [node.st_dev,node.st_ino] or header != expected_anchor['header']:
+                    raise MirrorError('source_replaced')
+        except OSError:
+            raise MirrorError('source_replaced') from None
+    with closing(sqlite3.connect(readonly_database_uri(path), uri=True)) as connection:
         connection.execute('PRAGMA query_only=ON')
         connection.execute('BEGIN')
         if connection.execute('SELECT * FROM __walden_binding').fetchall() != [(config['account_id'], config['source_generation'], path.name)]:
             raise MirrorError('source_identity_mismatch')
+        if account:
+            progress = connection.execute('SELECT value FROM __walden_progress WHERE table_name=?',(source['table'],)).fetchone()
+            if expected_anchor is not None and progress is None:
+                raise item_error('media_job_stale')
+            fact = json.loads(progress[0]) if progress else {}
+            if fact.get('cursor_epoch'):
+                raise item_error('cursor_generation_media_unavailable')
+            if expected_anchor is not None and (fact.get('source_identity')!=expected_anchor['source_identity']
+                    or fact.get('source_header_sha256')!=expected_anchor['header']):
+                raise MirrorError('scope_copy_proof')
         columns = [row[1] for row in connection.execute('PRAGMA table_info(' + qi(source['table']) + ')')]
         row = connection.execute('SELECT * FROM ' + qi(source['table']) + ' WHERE local_id=?', (source['local_id'],)).fetchone()
     if row is None:
-        raise MirrorError('media_message_changed')
+        raise item_error('media_message_changed')
     item = dict(zip(columns, row))
     message = RawMessage(item['local_id'], item.get('server_id'), item['local_type'], item['create_time'], item['real_sender_id'], item['message_content'], item['WCDB_CT_message_content'])
     if _content_fingerprint(message) != source['content_sha256']:
-        raise MirrorError('media_message_changed')
+        raise item_error('media_message_changed')
     return item
 
 
-def capture_window_images(config, root, window, opener, *, decode=True):
+def capture_window_images(config, root, window, opener, *, decode=True, capture_guard=None, output_root=None, ffmpeg=None):
+    from .native_media_segment import active, ordinary_owned
     check_deadline()
     gaps = []
     resources = None
@@ -44,11 +97,20 @@ def capture_window_images(config, root, window, opener, *, decode=True):
                 continue
             current['image'] = {'status': 'unavailable', 'reason': 'local_image_not_saved'}
             try:
-                item = frozen_message(config, root, current)
+                if capture_guard is None:
+                    item = frozen_message(config, root, current)
+                else:
+                    with capture_guard() as item:
+                        pass
                 identity = ImageMessageIdentity(window['selected_username'], item['server_id'], item['local_id'], item['create_time'], item['local_type'], ZoneInfo(config.get('query_timezone', 'UTC')))
                 key = _image_key(identity, current['source'])
-                _write_private(root, ('bounded-images', key), 'state.json', b'{"saved":false}')
-            except (MirrorError, TypeError, ValueError, OSError):
+                parts = ('bounded-images', key)
+                prior = _prior_image_capture(config, root, parts, current['source']) if ordinary_owned() else None
+                if capture_guard is None and prior is None and not active():
+                    _write_private(root, parts, 'state.json', b'{"saved":false}')
+            except (MirrorError, TypeError, ValueError, OSError) as error:
+                if capture_guard is not None and isinstance(error,MirrorError):
+                    raise
                 check_deadline()
                 current['image']['reason'] = 'image_identity_unavailable'
                 gaps.append('image_identity_unavailable')
@@ -63,18 +125,30 @@ def capture_window_images(config, root, window, opener, *, decode=True):
                     resources = opener(path)
                     resources.execute('BEGIN')
                 check_deadline()
+                if capture_guard is not None:
+                    with capture_guard():
+                        pass
+                # The raw representation names are content addressed. A
+                # failed guard leaves no new reference visible to readers.
                 bound = _bound_file(resources, identity, Path(config['image_attachments_root']))
                 facts = _image_resource_hash(resources, identity)
                 representations = []
+                prior_digests = {rep['sha256'] for rep in prior['representations']} if prior else set()
                 for (size, _), payload in zip(bound.files, bound._hardlink_bytes):
                     if payload is None:
                         raise ImageUnavailable('image_attachment_changed')
                     digest = hashlib.sha256(payload).hexdigest()
-                    _write_private(root, ('bounded-images', key), digest, payload)
+                    if digest not in prior_digests or not _same_capture_bytes(root, parts, digest, payload):
+                        _write_private(root, parts, digest, payload)
                     representations.append({'size': size, 'sha256': digest})
                 state = {'saved': True, 'account': config['account_id'], 'generation': config['source_generation'], 'resource': facts, 'message': current['source'], 'representations': representations, 'expected': list(bound.expected_sizes), 'missing': list(bound.missing_sizes)}
-                _write_private(root, ('bounded-images', key), 'state.json', json.dumps(state).encode())
-                current['image'] = decode_window_image(config, root, identity, current['source']) if decode else {'status':'saved'}
+                if prior != state:
+                    _write_private(root, parts, 'state.json', json.dumps(state).encode(),
+                                   commit_guard=capture_guard)
+                elif capture_guard is not None:
+                    with capture_guard():
+                        pass
+                current['image'] = decode_window_image(config, root, identity, current['source'], output_root=output_root, ffmpeg=ffmpeg) if decode else {'status':'saved'}
             except (ImageUnavailable, OSError, ValueError, KeyError) as error:
                 check_deadline()
                 gaps.append(error.code if isinstance(error, ImageUnavailable) else 'image_capture_unavailable')
@@ -84,7 +158,8 @@ def capture_window_images(config, root, window, opener, *, decode=True):
     return gaps
 
 
-def _read_private(root, parts, name, limit):
+@contextmanager
+def _open_private(root, parts, name):
     handles = []
     try:
         parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -94,35 +169,82 @@ def _read_private(root, parts, name, limit):
             handles.append(parent)
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         with os.fdopen(fd, 'rb') as source:
-            info = os.fstat(source.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-                raise ValueError('media_size')
-            return source.read(limit + 1)
+            yield source
     finally:
         for fd in reversed(handles):
             os.close(fd)
 
 
-def decode_window_image(config, root, identity, message_source=None):
+def _read_private(root, parts, name, limit):
+    with _open_private(root, parts, name) as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError('media_size')
+        return source.read(limit + 1)
+
+
+def _prior_image_capture(config, root, parts, source):
+    try:
+        state = json.loads(_read_private(root, parts, 'state.json', 65536))
+        if (type(state) is dict and state.get('saved') is True and state.get('message') == source
+                and state.get('account') == config['account_id'] and state.get('generation') == config['source_generation']
+                and type(state.get('representations')) is list and len(state['representations']) <= 8
+                and all(type(rep) is dict and type(rep.get('sha256')) is str
+                        for rep in state['representations'])):
+            return state
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def _same_capture_bytes(root, parts, digest, payload):
+    # Only consider exact, private local content. A resumed capture still
+    # proves this representation against the current Source before reusing it.
+    try:
+        with _open_private(root, parts, digest) as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_size != len(payload)):
+                return False
+            return all(source.read(262144) == payload[offset:offset+262144]
+                       for offset in range(0,len(payload),262144)) and not source.read(1)
+    except OSError:
+        return False
+
+
+def decode_window_image(config, root, identity, message_source=None, *, output_root=None, ffmpeg=None):
     from .image_runtime import _decode_image_bytes, read_private_image_config
+    from .native_media_segment import SegmentYield, checkpoint
     parts = ('bounded-images', _image_key(identity, message_source))
+    decoded = []
     try:
         state = json.loads(_read_private(root, parts, 'state.json', 65536))
         if (message_source is not None and state.get('message') != message_source) or not state.get('saved') or state['account'] != config['account_id'] or state['generation'] != config['source_generation']:
             raise ValueError('binding')
         codes, scope = read_private_image_config(Path(config['image_key_config'])) if config.get('image_key_config') else ((), '')
-        decoded = []
+        if ffmpeg is None and config.get('image_ffmpeg'):
+            ffmpeg = Path(config['image_ffmpeg'])
+        if output_root is None:
+            output_root = Path(config['image_output_root'])
         for representation in state['representations']:
+            checkpoint('image_decode')
             digest = representation['sha256']
             if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
                 raise ValueError('digest')
             payload = _read_private(root, parts, digest, 32 * 1024 * 1024)
             if hashlib.sha256(payload).hexdigest() != digest:
                 raise ValueError('digest')
-            result = _decode_image_bytes(payload, output_root=Path(config['image_output_root']), key_codes=codes, account_scope=scope, ffmpeg=Path(config['image_ffmpeg']) if config.get('image_ffmpeg') else None)
+            result = _decode_image_bytes(payload, output_root=output_root, key_codes=codes, account_scope=scope, ffmpeg=ffmpeg)
             decoded.append(dict(resource_size_bytes=representation['size'], **result))
         count = sum(row['status'] == 'decoded' for row in decoded)
         return {'status': 'decoded' if count == len(decoded) and not state['missing'] else 'partial' if count else 'unavailable', 'representations': decoded, 'expected_resource_sizes': state['expected'], 'missing_resource_sizes': state['missing']}
+    except SegmentYield:
+        # These paths were freshly allocated by this decode and never reached
+        # the job's SQLite publication. Captured raw state remains available.
+        for row in decoded:
+            if row['status']=='decoded':
+                Path(row['path']).unlink(missing_ok=True)
+        raise
     except (OSError, ValueError, KeyError, TypeError):
         return {'status': 'unavailable', 'reason': 'local_image_not_saved'}
 
@@ -146,10 +268,9 @@ def image_saved(resource, identity, root, message_source):
     except (OSError, ValueError, ImageUnavailable):
         return False
 from .live_readonly import readonly_database_uri
-from .native_mirror_store import MirrorError
 
 
-def _write_private(root, parts, name, payload):
+def _write_private(root, parts, name, payload, *, commit_guard=None):
     """Walk pinned directory descriptors; atomically replace one private file."""
     import secrets
     handles = []
@@ -178,8 +299,11 @@ def _write_private(root, parts, name, payload):
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
-        temporary = None
+        # Prepare/fsync before the optional short eligibility lock. Only
+        # the atomic metadata publication is inside it.
+        with commit_guard() if commit_guard is not None else nullcontext():
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary = None
     finally:
         if temporary is not None:
             os.unlink(temporary, dir_fd=parent)
@@ -305,7 +429,16 @@ def voice_capture_evidence(state,error=None,stage='request_audio_capture'):
     return dict(receipt_status='observed' if audio else 'unknown',audio=audio,failure=clean or (safe_voice_failure(error,stage) if error is not None else None))
 
 
-def save_voices(config, root, scope, opener, *, selected=None):
+def _voice_payload_name(key, state):
+    if state.get('content_addressed') is not True:
+        return key + '.silk'
+    digest = state.get('sha256')
+    if type(digest) is not str or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise MirrorError('local_audio_changed')
+    return key + '-' + digest + '.silk'
+
+
+def save_voices(config, root, scope, opener, *, selected=None, capture_guard=None):
     check_deadline()
     from contextlib import ExitStack
     from .source_setup import require_complete_voice_source, SourceSetupError
@@ -316,6 +449,8 @@ def save_voices(config, root, scope, opener, *, selected=None):
         unavailable = False
         source_failure=None
         for path in sorted(root.glob('message_*.db')) + sorted(root.glob('biz_message_*.db')):
+            if capture_guard is not None and selected is not None and not any(shard==path.name for shard,_,_ in selected):
+                continue
             message = stack.enter_context(sqlite3.connect(readonly_database_uri(path), uri=True))
             message.execute('PRAGMA query_only=ON')
             message.execute('BEGIN')
@@ -336,7 +471,8 @@ def save_voices(config, root, scope, opener, *, selected=None):
                     sql+=' AND local_id IN ('+','.join('?' for _ in ids)+')';args=tuple(ids)
                 for server, local, created, kind, packed, sender, content, compression in message.execute(sql,args):
                     key = voice_key(config, path.name, username, (server, local, created, kind, packed, sender, content, compression))
-                    _write_private(root, ('voice-state',), key + '.json', b'{"saved":false}')
+                    if capture_guard is None:
+                        _write_private(root, ('voice-state',), key + '.json', b'{"saved":false}')
                     if connections is None:
                         connections = []
                         try:
@@ -354,22 +490,29 @@ def save_voices(config, root, scope, opener, *, selected=None):
                                 connection.execute('BEGIN')
                                 connections.append(connection)
                         except (SourceSetupError, MirrorError, OSError, sqlite3.Error) as error:
-                            if isinstance(error,MirrorError) and str(error)=='source_replaced':raise
+                            if isinstance(error,MirrorError) and str(error) in ('source_replaced','media_source_unavailable'):raise
                             check_deadline()
                             unavailable = True;source_failure=safe_voice_failure(error,capture_stage)
                     check_deadline()
+                    if capture_guard is not None:
+                        with capture_guard():
+                            pass
                     capture_failure=source_failure
                     try:audio, payload = capture_bound_voice(connections, username, NativeVoiceIdentity(server, local, created), source_unavailable=unavailable)
                     except (SourceSetupError, MirrorError, OSError, sqlite3.Error,ValueError,KeyError,TypeError) as error:
-                        if isinstance(error,MirrorError) and str(error)=='source_replaced':raise
+                        if isinstance(error,MirrorError) and str(error) in ('source_replaced','media_source_unavailable'):raise
                         check_deadline()
                         audio={};payload=None;capture_failure=safe_voice_failure(error,'voice_capture')
                     safe_audio=safe_voice_audio(audio)
-                    _write_private(root,('voice-state',),key+'.json',json.dumps(dict(saved=False,audio=safe_audio,capture_failure=capture_failure)).encode())
+                    if capture_guard is None:
+                        _write_private(root,('voice-state',),key+'.json',json.dumps(dict(saved=False,audio=safe_audio,capture_failure=capture_failure)).encode())
                     if payload is None:
                         gaps.append('voice_source_unavailable')
                         continue
-                    _write_private(root, ('voice-payloads',), key + '.silk', payload)
                     state = {'saved': True, 'sha256': hashlib.sha256(payload).hexdigest(), 'audio': safe_audio}
-                    _write_private(root, ('voice-state',), key + '.json', json.dumps(state).encode())
+                    if capture_guard is not None:
+                        state['content_addressed']=True
+                    _write_private(root, ('voice-payloads',), _voice_payload_name(key,state), payload)
+                    _write_private(root, ('voice-state',), key + '.json', json.dumps(state).encode(),
+                                   commit_guard=capture_guard)
     return sorted(set(gaps))

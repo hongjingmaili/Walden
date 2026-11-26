@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+from .native_media_segment import checkpoint
 import tempfile
 import wave
 from pathlib import Path
@@ -142,6 +143,7 @@ class LocalWhisperTranscriber:
         root=root.resolve();pilk=root/'python'
         if pilk.is_symlink() or not (pilk/'pilk').is_dir():raise LocalVoiceRuntimeError('decoder_unavailable')
         python=self._external_python(self.python_executable_input)
+        checkpoint('voice_decode')
         with tempfile.TemporaryDirectory(prefix='voice-decode-',dir=root) as temporary:
             run=Path(temporary).resolve()
             if not run.is_relative_to(root):raise LocalVoiceRuntimeError('decoder_unavailable')
@@ -169,6 +171,7 @@ class LocalWhisperTranscriber:
             or (len(payload) > 1 and payload[1:].startswith(b"#!SILK_V3"))
         ):
             raise LocalVoiceRuntimeError("audio_format_unsupported")
+        checkpoint('voice_asr')
         self._prepare()
         if not self._model_verified:
             if _sha256_file(self.model) != EXPECTED_MODEL_SHA256:

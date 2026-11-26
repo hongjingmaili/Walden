@@ -67,11 +67,25 @@ A system execution denial requires diagnosis for the exact identified private de
 
 Treat launch failure and waiting for the user's login as separate stages. Exit 9 alone does not establish Gatekeeper rejection, and exit 255 alone does not establish a lock conflict. A static assessment alone does not establish how a later launch will behave. Record actual evidence and preserve the configuration and copy during a retry.
 
-Claim verified first capture only when the receipt reports `credential_capture=captured_and_verified` and status `configured` or `configured_with_voice_incomplete`, with validation, persistence, configuration and target/group cleanup confirmed. Report the voice gap for `configured_with_voice_incomplete`. A configured profile does not establish mirror initialization or complete history. Follow the configured result and separate source-copy authorization for init.
+Claim verified first capture only when the configuration receipt (inside `configuration` for onboarding) reports `credential_capture=captured_and_verified` and status `configured` or `configured_with_voice_incomplete`, with validation, persistence, configuration and target/group cleanup confirmed. Report the voice gap for `configured_with_voice_incomplete`. A configured profile does not establish mirror initialization or complete history. For configuration-only setup follow the configured result and separate source-copy authorization for init; confirmed onboarding already includes that exact scope and background permission.
 
-For a separately authorized new installation, select the explicit single-account root and already-authorized stable username scope. Run the same environment's `wechat-local-setup --account-root <root> --mirror-username <stable> --timezone <known-zone>`; repeat `--mirror-username` for each authorized scope. No implicit whole-account scope, guessed username or discovery of unrelated conversations. With no established scope, report that prerequisite rather than using another source or asking the user to hand-edit JSON.
+For first use, collect and reuse the user's confirmed single-account root, their own stable username, query timezone, and one exact synchronization choice: a list of confirmed stable conversation usernames **or** explicit whole-account scope. Explain that this choice copies messages to a private local mirror and enables continuous background synchronization. Ask once for any missing account/scope/background permission; existing explicit confirmation remains valid. Never guess a stable username, infer whole-account permission, widen the selection, or ask the user to assemble/run separate commands. The user personally completes login and OS permission prompts. Do not request or expose credentials.
 
-Setup discovers/validates metadata and writes a private native profile; it does not run a message baseline or create EventStore/AgentStore. On `configured`/`configured_with_voice_incomplete`, report `next_step=init` and separate self/media readiness. Only with source-copy authority run `wechat-local-sync init --source-config <profile>`; `once` continues independent history/tail progress and `status` reports local state. Query local or explicitly refresh afterwards. Configuring scope is not blanket permission for every source/attachment read. An existing bound mirror/profile needs **no reinitialization** for slimming; preserve account/generation, rows/cursors and all private files. Existing optional evidence paths are not migrated, auto-discovered or written.
+After that confirmation, call the adjacent installed `wechat-local-setup --account-root <root> --confirm-self-username <self> --timezone <zone> --start-sync --confirmed`, adding repeated `--mirror-username <stable>` for exactly the selected conversations, **or** `--account-scope` for the explicitly confirmed whole account. Keep the chosen private `--config` and `--data-home` on every retry. `--start-sync` acquires/validates credentials automatically when no imported credential is supplied, configures the source, initializes the copy and calls the existing follow service. Use the same installed environment; do not run source checkout code or hand-edit the profile. No new GUI, source/account discovery or scheduler is involved.
+
+Report the returned `stage`, `configuration`, `initialization`, `background`, `coverage`, `sync_health` and gaps. `onboarding_complete` / `background_registered` acknowledges owned listener registration, not healthy copying or complete history. The first call returns without waiting for all history. Selected scope performs one bounded initialization; account scope first publishes an empty protected registry/contract and reports `copy_pending`, while actual source copying remains exclusive to the existing owned follow chain. New messages take priority and spare budget fills history; continuous new traffic can delay history. Unknown health/history stays unknown. A registered job can still be starting, waiting or failing; use `follow-status` for a later authorized observation, not an unbounded polling loop.
+
+For newly registered account members, the first actual batch copies a latest suffix while historical prefix coverage stays at zero. A new shard may need one additional owned round to persist its exact shell receipt before publication. Pending initialization is not latest/history completeness. Legacy missing tables/progress without positive first-copy ownership remain unknown. `account_copy_init_uncommitted_stage` preserves an unowned temporary file and stops automatic retries; do not adopt, delete or repeatedly recreate it. Running an older package against unfinished initialization is not an automatic rollback path; use the separately reviewed stopped full-backup recovery.
+
+Only when the user explicitly confirms the same account/source and rebuilding one registered target whose table, progress and observed-copy records are all absent, use the installed sync entry's `account-copy-reconcile`. Obtain its exact reference from `account-scope-status`, call the local plan with `--registered-target-ref`, then submit with its `--expected-source-sha256` and `--confirmed`. Reuse existing explicit confirmation; do not ask the user to assemble hashes or refs. This is distinct from ordinary query/request/authorize-copy. The command only records one protected intent; the existing owned follow grant validates the current Source and creates that target when known tail and original budget permit. Never repair a missing member/shard, any existing table (even empty), progress/fingerprint residue, mismatched binding, or another initialization's artifacts. Report `prior_coverage_unknown` permanently even when the new H is copied; current snapshot catchup is separate. Unknown alone is not retryable historical debt. A same-wheel reinstall must preserve the intent, generation, rows and unknown flag. Older writers do not understand these semantics; only the reviewed stopped exact-backup rollback is supported.
+
+On failure or cancellation, show the actual stage and preserve the same profile and paths. No background is enabled before credentials/configuration and initialization succeed. A failed enable may have saved an enabled intent without a registered listener; preserve its actual returned status and retry the same confirmed setup. Repeating setup preserves the source generation, copy progress and owned service, and does not re-register an already owned listener. A different account, own identity, destination, scope or timezone is a conflict, never an automatic replacement or migration. Existing selected scope cannot become account scope through this first-use path; use the separately authorized migration workflow. Concurrent setup returns `onboarding_busy`.
+
+Account initialization records this confirmed first-use creation before capturing credentials, and publishes the complete empty registry/receipt/current contract with an exclusive atomic rename. An immutable private publication witness outside the mirror binds the profile/config digest, final path, staging inode and every initial file hash before rename. Only that exact unconsumed stage may resume the same publication. Earlier incomplete stages are retained and reported in `initialization.staging_directory`; they are not repaired, trusted as proof, or automatically deleted. A consumed stage with a missing destination returns `onboarding_initialized_copy_missing`: restore the same preserved copy rather than create an empty replacement. An unknown account profile without this workflow's creation proof cannot initialize a missing destination, even if no service intent exists. Unknown/occupied destinations, changed witnesses, corrupted committed contracts or uncertain file ownership stop; never clear a directory to make setup pass.
+
+On an existing-profile retry, saved credentials are read through the formal private-passphrase check and validated by read-only metadata opening against the same bound source before initialization or service changes. Missing, malformed or wrong credentials stop at `credential_validation`; do not register a job and defer validation to it. Cancellation after capture but before profile publication removes only this attempt's still-owned credential with its exact original parent/inode binding. Replaced or foreign files are retained; retry does not force-remove them.
+
+Without `--start-sync`, setup retains its configuration-only behavior and returns `next_step=init`; a configured profile alone does not establish copying or background permission. Advanced/manual selected setup can separately run authorized `wechat-local-sync init` / `once` / `status`. New native setup creates no EventStore/AgentStore reply evidence. Existing copies need no reset for slimming or upgrades; preserve account/generation, rows/cursors and all private files.
 
 For a root in the supported local layout, run `wechat-local-setup --account-root <that-directory> --mirror-username <authorized-stable> --acquire-passphrase`. The setup uses
 only `/Applications/WeChat.app`, the locally selected `xcrun --find lldb`, and the data-home derived
@@ -220,3 +234,114 @@ Committed daily Source recovery is a separate explicitly authorized maintenance 
 Strong recovery mismatch status may contain a first bounded diagnostic: frozen database/table ordinals, column ordinal (0=rowid; 1..N=frozen Source columns), SQLite storage/Python type categories, missing/count/value/schema kind and comparison counts. It contains no values, row IDs, row hashes, paths, SQL or exception args. This is an observed mismatch in a failed incomplete verification, never proof that a changed row is acceptable or a reason to relax full typed matching. Missing/interrupted/unsaved diagnostics remain explicitly unknown. New diagnostics require the same installed finite verify-only role after necessary review, never an ad hoc Source probe.
 
 The explicit maintenance flag `--refresh-authorized-auxiliary` permits only the originally configured complete encrypted-contact metadata snapshot to become a clearly labeled new observation, including new metadata rows. Message committed-ID full typed continuity stays mandatory; no new message IDs or other conversation body may be copied. Contact table sets/schema/indexes/account/self/roots must match supported original bindings. Before acceptance, preserve the entire old auxiliary SQLite database, all schema/data/binding/metadata, as a private durable read-only hash-bound archive; build and retain a separate complete new snapshot. One attached transaction must commit exact new auxiliary data, verified identity and the receipt referencing both artifacts, with a precise same-connection postcondition. Verify-only changes no original mirror files. This replaces the earlier maintenance-only auxiliary-old-row-equality condition; it is not a per-column exemption, an automatic retry/fallback, or authority to ignore message differences. Other auxiliary sources retain their original strict contract.
+
+## Account registry storage maintenance (0.9.3)
+
+Ordinary queries do not authorize a storage upgrade. For an explicitly approved installation/maintenance task, use the adjacent installed `wechat-local-sync registry-reuse --source-config <profile>` to obtain the local plan, then call it with `--confirmed --expected-source-sha256 <plan.source_sha256>` only after the existing account follow service is stopped. Resolve the real profile and hash through the installed tools; do not ask the user to assemble identifiers. Confirmed account setup connects this storage step automatically; a repeated compatible setup retains the same generation. This operation opens no Source/credentials/service and does not reset message data, progress, observed fingerprints or prior coverage unknown.
+
+Shared ordered table lists retain duplicates, full source boundaries and complete old observation reconstruction. All historical evidence remains authoritative for first-copy decisions even though routine snapshots contain only current observation references. Unknown, partial, conflicting or replaced migration artifacts remain failures; preserve them and report the phase. There is at most one fresh owned retry of an interrupted build. Do not delete artifacts, expand the 128MiB limits, rerun old writers on the new format, or replace advancing data with an old backup. Keep the forward copy and a complete compatible old backup separate. SQLite 3.43+ `octet_length` is required for migration; unsupported engines fail closed. See the paired installation document for bounded input/current-object budgets and platform-specific atomic-publication limits.
+
+## Background batch evidence (0.9.5)
+
+Use the installed same-source entry. A completed background batch reports actual committed rows/PG, not whole-account catchup. Treat `completeness=unknown` / `status_check=not_run` as unverified and use the existing bounded account-scope-status entry only when needed. Keep prior coverage gaps visible. Budget deferral means unfinished work; an actual identity/file/transaction guard failure remains a failure. The global writer permits at most three committed tail batches before one serviceable verified historical batch of at most500 rows, then resumes tail priority. No completion deadline is promised. Do not reset progress, obtain new credentials, change range, or start another listener to force a green result.
+
+## Explicit local shard restoration (0.9.6)
+
+Queries and SQLite errors do not authorize repair. For a separately approved stopped-account restoration task, follow the paired installation document and use only the installed `account-shard-restore-plan`, `account-shard-restore`, and `account-shard-restore-status` commands. Obtain the exact registered target and plan hash through the existing tools. Preserve the full forward copy and strict original SDK stop proof first. Keep the plan output, replacement input and restore stage outside configured Source paths and protected credential references. Never construct credentials, change account/source bindings, clear pending, reset PG, adopt a different inode by equal bytes, or reinstall a completed initial snapshot over later progress. A pending/unsealed/unknown result stays a failure until the explicitly pinned recovery can prove its own sides. This does not authorize daily deployment, Source access or sending.
+
+## Background preparation evidence (0.9.7)
+
+Use the installed `follow-status` output to map the listener task ID and bounded worker preparation phase to existing failure evidence. In-progress/crash state remains unknown. A failed call may report not-attempted-by-this-call, attempted-unknown, or API-returned; none proves worker exit, Source completion, permission or strict stop. Never clear pending, change permission, or retry a failed service merely from these diagnostics. Missing legacy fields remain unknown.
+
+## Revoked legacy slot after a kernel change (0.9.8)
+
+The explicit maintenance commands `follow-legacy-retirement-plan` and
+`follow-legacy-retire-after-boot` only handle a revoked account-bound legacy
+pending slot whose original operation/receipts are missing. They do not cancel
+a job, restart the computer, change privacy permissions, admit Source work or
+prove historical submission/SQL outcomes. Same-boot retirement is refused.
+
+A separately installed maintenance package may read the unchanged original
+profile and create the plan under the original follow/writer locks; the daily
+runtime/configuration must not be switched merely to obtain a plan. The plan
+captures a public kernel boot-session UUID prospectively. Only after a genuine
+new kernel generation, unchanged ownership/account/scope/revocation evidence,
+absent exact services/material and exclusive writer lock may retirement publish
+a distinct disabled instance. Reboot alone is insufficient. Missing or changed
+evidence fails closed; do not reconstruct receipts, clear pending, or signal
+unknown processes. Retain a complete forward backup before any later deployment.
+
+The plan command requires `--authorize-legacy-retirement`,
+`--expected-source-sha256` and `--expected-policy-generation`; it returns a
+retirement ID and plan SHA-256. Apply requires the same explicit authorization
+and `--legacy-retirement-id` / `--legacy-retirement-plan-sha256`. It preserves
+unknown control evidence and never rewinds legitimate later progress on retry.
+These commands require separate operation authorization; their presence in an
+installed package is not permission to run them or reboot.
+
+A completed receipt is historical evidence only. Current stop/status also
+rechecks original lock identities, current account/scope/revocation and both
+exact services in the bound caller context. A new lock inode, service reload
+or unknown observation refuses current strict; historical replay never rewinds
+later progress or promises the current service is stopped.
+
+## Current-state retirement witness (0.9.9, explicit maintenance only)
+
+A separately authorized exceptional recovery may use
+`follow-current-state-recovery-plan` / `follow-current-state-recover` to create a
+NEW retirement-only authority from the current protected namespace. This does
+not repair, migrate or re-sign an old legacy plan/owner or prove old volume,
+submission or SQL continuity. Do not invoke it as a query failure fallback.
+Same-Mac/non-migration is a trusted operator precondition; current volume UUID
+is not hardware attestation. It requires fresh native currentBoot != oldPlanBoot,
+unchanged account/scope and original control bytes, explicit four hash anchors,
+a canonical/private current home-volume identity closure, disabled intent,
+absent exact services/material and existing-lock exclusion. SourceAuthority is
+always false. Missing/unknown/changed evidence refuses; never clear pending,
+change permissions, reanchor Source, signal, or reinstall old state to proceed.
+
+The plan command requires `--authorize-current-state-recovery`, the original
+`--expected-source-sha256`, `--legacy-retirement-id`,
+`--legacy-retirement-plan-sha256`, `--current-recovery-owner-sha256`,
+`--current-recovery-preboot-receipt` and its
+`--current-recovery-preboot-receipt-sha256`. It returns a witness ID and a
+**witness fingerprint**: SHA-256 of the encoded current stable ticket pin
+(identity AND content), not merely the raw ticket bytes. Recover requires the
+same explicit authorization plus `--current-recovery-witness-id` and
+`--current-recovery-witness-fingerprint`; it must run in the witness's current
+kernel generation. No extra reboot is requested. Plans and unknown evidence
+stay intact. A partial unsealed witness is a failure, never silently adopted.
+
+Completed receipts are historical only. Fresh maintenance `follow-status`
+rechecks the current witness/object/lock ownership, account/revocation and both
+exact services before strict can be confirmed. Preserve and verify a whole
+forward copy before any later installation or enabling. The maintenance
+interpreter/package must independently be verified as CURRENT trusted inputs;
+old image receipts lacking stable volume identity are not repaired here.
+Isolation acceptance does not authorize real adoption or show TCC/Source
+readability, normal synchronization, or old messages recovered.
+
+
+## Current missing-copy qualification (0.9.10, explicit confirmation)
+
+A legacy reconcile request has no stable-volume proof. Never edit its device number, consume it on hash/inode alone, or treat the current object as proof of old continuity. With explicit confirmation for the same original target, use the installed `account-copy-reconcile` with `--confirmed`, `--registered-target-ref`, `--expected-source-sha256`, `--authorize-current-reconcile`, and the exact original `--expected-reconcile-request-sha256`. This local-only confirmation preserves the original bytes/generation and creates no Source connection. The owned active follow role must independently establish a new current Source qualification: canonical same-FD stable volume/file identity, current account/scope/profile and local identity, readonly connection/DDL, original member and COMMIT guards. This may align this Source shard's source-identity metadata/observations/anchor and PG source stamps; old messages and copy cursors are preserved. Historical continuity remains unknown. Current qualification permits only this target's empty table/initial PG; it does not create another message slot or bypass normal new-tail/history priority.
+
+Only if the user also explicitly approves leaving at most two exact registered targets on this same shard uninitialized, repeat `--withhold-unowned-target-ref` for those exact refs in the same confirmation. Do not infer or automatically add refs from absent PGs. This records no copy grant for them. Each selected candidate must freshly validate the current qualified Source object/readonly DDL, account/scope/profile/member, current local file, complete absence of table/PG/observed records and CI authority. Only then report `authorization_required`, coverage unknown and complete false without serving it. Residue, another ref, wrong object/volume, missing evidence or authority continues to fail closed. A consumed target receipt never exempts the withheld candidates from these fresh checks.
+
+Repeating the same confirmation is idempotent; changing its withheld refs is rejected. A guarded tentative object binding persists before qualification reads; budget/interruption recovery can continue only that object. A permanent qualification failure stays blocked across ordinary listener/policy changes; enabling again does not mint a new current trust decision. Old writers reject this request schema. Neither qualification nor copying the new H removes `prior_history_coverage_unknown`; formal local queries may return exit 1 with that exact coverage gap while returning valid local rows and Source opens 0. Do not treat that gap as a successful historical continuity proof or as a Source runtime failure.
+
+
+## Public service read retry (0.9.11)
+
+Exact public job reads may retry only EINTR/EAGAIN/ETIMEDOUT or an unavailable public domain container, at most three reads with 50 ms intervals (100 ms explicit waiting per lookup). This is not a submit/remove retry or permission repair. Context, malformed identity, PID/nonce conflicts and persistent unknown still fail closed; every authority/Source/COMMIT check remains required. Isolation success is not proof of the cause of a historical OS failure.
+
+
+## Bounded media dispatch (0.9.12)
+
+The existing owned media child processes at most four capture, voice or OCR selections per small batch, one claim at a time. It may continue only after confirmed ready progress and eligible remaining work, within the original child/worker deadline, at most eight batches and 32 total selections/attempts including failures and OCR. It yields for writer contention, host/process pressure, unreadable resource metrics, near deadlines or no progress. It never resets the inherited 120-second media deadline or starts another media child.
+
+New-media preference requires a recently checked, already caught-up tail boundary from the normal copier. Initialization, suffix, catch-up, history, repair, migration and missing evidence remain historical; old queued jobs are never relabeled by scan or upgrade time. Message CreateTime is only an additional scheduling filter, never evidence of arrival on the Mac. Each lane alternates image/voice opportunities, with at most three recent selections before a historical selection when both lanes stay eligible; OCR has a separate durable matching rotation and a reserved opportunity per small batch. These are bounded service opportunities, not completion-time promises: unavailable attachments, retries, pressure, deadlines and failed OCR remain explicit. Single-item failures retain bounded due-time retries; systematic Source failures stop the child without bypassing authority.
+
+Formal local-only queries only read existing cached output. They do not enqueue, open Source, invoke decoders/ASR/OCR or start synchronization. Isolation timing with synthetic input or outer service/cipher/ASR substitutes does not establish real-WeChat arrival latency or speech-recognition performance.
+
+OCR maintenance is separate from the 32 business selections/attempts: each small batch additionally verifies at most one cached image and considers at most one admission, at most16 maintenance-object opportunities across8 batches (48 object opportunities in total). Maintenance and actual OCR payload read attempts, completed read bytes and failures are reported separately; object opportunities are not disk-read counts. Failed reads can leave their partial byte count unknown. All work shares the original deadline, each PNG read retains the32MiB limit, and no later OCR opportunity in that batch repeats maintenance. Legacy direct OCR callers retain their original bounded default.

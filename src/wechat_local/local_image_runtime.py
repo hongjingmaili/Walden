@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 import stat
 import subprocess
+from .native_media_segment import checkpoint
 
 MAX_PNG = 32 * 1024 * 1024
 LANGUAGES = ('zh-Hans', 'en-US')
@@ -75,6 +76,7 @@ class LocalVisionRecognizer:
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o700:
                 raise LocalImageRuntimeError('ocr_runtime_binding')
             return binary
+        checkpoint('ocr_build')
         source = self.root / ('vision-' + tag + '.swift')
         # An exclusive file prevents following pre-existing links or replacing foreign content.
         try:
@@ -111,6 +113,7 @@ class LocalVisionRecognizer:
         if not payload.startswith(b'\x89PNG\r\n\x1a\n') or len(payload) > MAX_PNG:
             raise LocalImageRuntimeError('ocr_input_invalid')
         binary = self._prepare()
+        checkpoint('ocr_inference')
         try:
             result = subprocess.run([str(binary)], input=payload, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, check=True, timeout=timeout,

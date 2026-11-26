@@ -13,6 +13,10 @@ import re
 import sys
 
 
+class ServiceReadUnavailable(OSError):
+    """Public domain query returned no container; cause/permission stays unknown."""
+
+
 class PublicService:
     DOMAIN = 'kSMDomainUserLaunchd'
 
@@ -122,7 +126,7 @@ class PublicService:
         # Never serialize the container or decode any non-target job.
         # Validate every Label and uniqueness before decoding the exact target.
         array=self.copy_all(self.domain)
-        if not array:raise OSError('public service domain query failed')
+        if not array:raise ServiceReadUnavailable('public service domain query failed')
         key=None
         try:
             if self.type_id(array)!=self.array_type():raise OSError('public domain container invalid')

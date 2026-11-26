@@ -8,6 +8,7 @@ identity. It never searches all attachments or selects a file by size alone.
 from __future__ import annotations
 
 from .native_deadline import check_deadline
+from .native_media_segment import checkpoint
 
 import hashlib
 import io
@@ -37,6 +38,8 @@ except ImportError:  # optional image extras
 MAX_INPUT_BYTES = 32 * 1024 * 1024
 MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 MAX_PIXELS = 25_000_000
+MAX_PREVIEW_PIXELS = 2_000_000
+MAX_PREVIEW_INPUT_BYTES = 512 * 1024
 MAX_FFMPEG_ALLOC = 64 * 1024 * 1024
 FFMPEG_TIMEOUT_SECONDS = 25
 _IMAGE_TOKEN = re.compile(rb"[a-fA-F0-9]{32}")
@@ -173,15 +176,16 @@ def _read_same_inode(paths: list[Path], expected_size: int,
             os.close(handle)
 
 
-def _resource_facts(resource_connection: Any, identity: ImageMessageIdentity) -> tuple[Any, bytes, tuple[int, ...]]:
+def _resource_facts(resource_connection: Any, identity: ImageMessageIdentity, *, preview_only=False) -> tuple[Any, bytes, tuple[int, ...]]:
     """Capture only the exact image resource metadata used for association."""
     _query_only(resource_connection)
+    packed = 'CASE WHEN length(i.packed_info)<=65536 THEN i.packed_info END' if preview_only else 'i.packed_info'
     rows = resource_connection.execute(
-        """SELECT i.message_id, i.packed_info
+        f"""SELECT i.message_id, {packed}
              FROM MessageResourceInfo AS i JOIN ChatName2Id AS n ON n.rowid = i.chat_id
             WHERE n.user_name = ? AND i.message_svr_id = ?
               AND i.message_local_id = ? AND i.message_create_time = ?
-              AND i.message_local_type = ?""",
+              AND i.message_local_type = ?""" + (' LIMIT 2' if preview_only else ''),
         (identity.conversation_id, identity.server_id, identity.local_id,
          identity.create_time, identity.local_type & 0xFFFFFFFF),
     ).fetchall()
@@ -192,9 +196,15 @@ def _resource_facts(resource_connection: Any, identity: ImageMessageIdentity) ->
         raise ImageUnavailable("image_resource_unavailable")
     try:
         packed = bytes(packed_info)
-        sizes = tuple(sorted({int(row[0]) for row in resource_connection.execute(
-            "SELECT size FROM MessageResourceDetail WHERE message_id = ?", (message_id,)
-        ).fetchall() if row and row[0] is not None and int(row[0]) > 0}))
+        detail = resource_connection.execute(
+            "SELECT size FROM MessageResourceDetail WHERE message_id = ?" + (' LIMIT 9' if preview_only else ''),
+            (message_id,)).fetchall()
+        if preview_only:
+            if len(detail)>8 or any(type(size) is not int or size<=0 for size, in detail):
+                raise ImageUnavailable('image_preview_unavailable')
+            sizes = tuple(sorted({size for size, in detail}))
+        else:
+            sizes = tuple(sorted({int(row[0]) for row in detail if row and row[0] is not None and int(row[0]) > 0}))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ImageUnavailable("image_resource_unavailable") from exc
     return message_id, packed, sizes
@@ -210,7 +220,7 @@ def _bound_file(
     resource_connection: Any,
     identity: ImageMessageIdentity,
     attachments_root: Path,
-    *, _facts: tuple[Any, bytes, tuple[int, ...]] | None = None,
+    *, _facts: tuple[Any, bytes, tuple[int, ...]] | None = None, preview_only: bool = False,
 ) -> ImageRepresentations:
     """Resolve all metadata-sized representations for one exact message identity."""
 
@@ -221,6 +231,11 @@ def _bound_file(
     sizes = set(detail_sizes)
     if not sizes or any(size > MAX_INPUT_BYTES for size in sizes):
         raise ImageUnavailable("image_resource_unavailable")
+    expected_sizes = tuple(sorted(sizes))
+    if preview_only:
+        if len(sizes)<2 or expected_sizes[0]>MAX_PREVIEW_INPUT_BYTES:
+            raise ImageUnavailable('image_preview_unavailable')
+        sizes = {expected_sizes[0]}
     month = datetime.fromtimestamp(identity.create_time, identity.display_timezone).strftime("%Y-%m")
     if attachments_root.is_symlink():
         raise ImageUnavailable("image_attachment_missing")
@@ -257,7 +272,9 @@ def _bound_file(
     for expected_size in sorted(sizes):
         matches: list[Path] = []
         candidate_stats: dict[Path, os.stat_result] = {}
-        for candidate in folder.glob(token + "*"):
+        for position,candidate in enumerate(folder.glob(token + "*")):
+            if preview_only and position>=32:
+                raise ImageUnavailable('image_preview_unavailable')
             if candidate.is_symlink() or not candidate.is_file():
                 continue
             try:
@@ -282,7 +299,7 @@ def _bound_file(
             missing_sizes.append(expected_size)
     if not representations:
         raise ImageUnavailable("image_attachment_missing")
-    return ImageRepresentations(tuple(sorted(sizes)), tuple(representations), tuple(missing_sizes), tuple(hardlink_bytes))
+    return ImageRepresentations(expected_sizes, tuple(representations), tuple(missing_sizes), tuple(hardlink_bytes))
 
 
 def _decrypt_v2(data: bytes, key_codes: Iterable[int], account_scope: str) -> bytes:
@@ -323,6 +340,7 @@ def _hevc_first_frame(data: bytes, ffmpeg: Path) -> bytes:
     try:
         if Image is None:
             raise ImageUnavailable("image_decoder_unavailable")
+        checkpoint('image_ffmpeg')
         result = subprocess.run(
             [
                 str(ffmpeg), "-hide_banner", "-loglevel", "error", "-max_alloc", str(MAX_FFMPEG_ALLOC),
@@ -364,15 +382,34 @@ def _trusted_decoder_directory(path: Path) -> bool:
     return True
 
 
+def _explicit_decoder_path(value):
+    """Check configuration syntax without touching the executable."""
+    if type(value) is not str or not value or chr(0) in value:
+        raise ValueError('image_decoder_config_invalid')
+    path = Path(value)
+    if not path.is_absolute() or '..' in path.parts or str(path) != value:
+        raise ValueError('image_decoder_config_invalid')
+    return path
+
+
+def _explicit_decoder(value):
+    """Validate the regular executable only when installing or running it."""
+    try:
+        path = _explicit_decoder_path(value)
+        info = path.lstat()
+        if (not _trusted_decoder_directory(path.parent)
+                or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or info.st_mode & 0o022 or not os.access(path,os.X_OK)):
+            raise ValueError('image_decoder_config_invalid')
+        return path.resolve(strict=True)
+    except (OSError,RuntimeError,ValueError) as error:
+        raise ImageUnavailable('image_decoder_config_invalid') from error
+
+
 def _image_ffmpeg(explicit: Path | None) -> Path:
     """Use an explicit executable first, otherwise a trusted absolute PATH entry."""
     if explicit is not None:
-        try:
-            if explicit.is_symlink() or not explicit.is_file() or not os.access(explicit,os.X_OK):
-                raise ImageUnavailable('image_decoder_config_invalid')
-            return explicit
-        except OSError as exc:
-            raise ImageUnavailable('image_decoder_config_invalid') from exc
+        return _explicit_decoder(str(explicit))
     path=os.environ.get('PATH','')
     if len(path)>65536:raise ImageUnavailable('image_decoder_unavailable')
     for entry in path.split(os.pathsep)[:128]:
@@ -422,10 +459,11 @@ def _decode_image_bytes(
     key_codes: Iterable[int] = (),
     account_scope: str = "",
     ffmpeg: Path | None = None,
+    preview_only: bool = False,
 ) -> dict[str, Any]:
     """Decode already-read, bounded bytes without reopening a source path."""
     try:
-        if not raw or len(raw) > MAX_INPUT_BYTES:
+        if not raw or len(raw) > (MAX_PREVIEW_INPUT_BYTES if preview_only else MAX_INPUT_BYTES):
             raise ImageUnavailable('image_input_unavailable')
         if Image is None:
             raise ImageUnavailable('image_decoder_unavailable')
@@ -435,6 +473,8 @@ def _decode_image_bytes(
             decoded = raw
         first_frame_only = False
         if decoded.startswith(b"wxgf"):
+            if preview_only:
+                raise ImageUnavailable('image_preview_unavailable')
             decoded = _hevc_first_frame(decoded, _image_ffmpeg(ffmpeg))
             first_frame_only = True
         if len(decoded) > MAX_OUTPUT_BYTES:
@@ -444,11 +484,16 @@ def _decode_image_bytes(
         with Image.open(io.BytesIO(decoded)) as image:
             if image.format not in {"PNG", "JPEG", "GIF"}:
                 raise ImageUnavailable("image_format_unsupported")
-            image.load()
-            if image.width * image.height > MAX_PIXELS:
+            if image.width * image.height > (MAX_PREVIEW_PIXELS if preview_only else MAX_PIXELS):
                 raise ImageUnavailable("image_pixel_limit")
+            image.load()
             if image.format == "GIF":
                 image.seek(0)
+            if preview_only:
+                stream = io.BytesIO()
+                image.convert("RGB").save(stream,format="PNG",optimize=False)
+                return {"status":"decoded","png":stream.getvalue(),"size":[image.width,image.height]}
+            checkpoint('image_decode')
             output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
             if output_root.is_symlink():
                 raise ImageUnavailable("image_output_unavailable")

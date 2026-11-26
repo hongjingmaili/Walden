@@ -3,9 +3,25 @@ import ctypes as C
 import errno
 import os
 import signal
+import subprocess
+import re
 import time
 from .native_mirror_store import MirrorError
 from .native_deadline import continuous_ns
+
+
+def boot_session():
+    """Public kernel generation; not a process/RSS observation or user input."""
+    try:
+        result=subprocess.run(['/usr/sbin/sysctl','-n','kern.bootsessionuuid'],
+                              capture_output=True,timeout=2,check=False)
+        value=result.stdout.decode('ascii').strip()
+    except (OSError,subprocess.SubprocessError,UnicodeError):
+        raise MirrorError('follow_boot_generation_unknown') from None
+    if result.returncode or len(result.stdout)>128 or not re.fullmatch(
+            r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',value):
+        raise MirrorError('follow_boot_generation_unknown')
+    return value.lower()
 
 class _BSDInfo(C.Structure):
     _fields_=[(name,C.c_uint32) for name in ('flags','status','xstatus','pid','ppid','uid','gid','ruid','rgid','svuid','svgid','reserved')]+[('comm',C.c_char*16),('name',C.c_char*32)]+[(name,C.c_uint32) for name in ('nfiles','pgid','pjobc','tdev','tpgid')]+[('nice',C.c_int32),('start_sec',C.c_uint64),('start_usec',C.c_uint64)]
@@ -69,4 +85,4 @@ def drained(expected):
 
 
 from .failure_evidence import _register
-_register(_lib, identity, same_generation, group_members, require_own_leader, signal_own_group, drained)
+_register(boot_session, _lib, identity, same_generation, group_members, require_own_leader, signal_own_group, drained)

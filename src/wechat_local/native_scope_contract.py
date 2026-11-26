@@ -3,6 +3,7 @@
 No Source opens, key access, service control or implicit all-scope conversion.
 Registry observations are produced only by the admitted bounded synchronizer.
 """
+from collections import OrderedDict
 import contextlib
 import hashlib
 import json
@@ -75,6 +76,13 @@ def _pending(root):
 
 def token(config):
     root=Path(config['mirror_root']);_pending(root)
+    value=_account_current_proof(config)
+    _pending(root)
+    return value
+
+def _account_current_proof(config):
+    """Contract proof only; normal callers must use token and its pending fences."""
+    root=Path(config['mirror_root'])
     current=_optional(root/CURRENT)
     if current is None:
         need(mode(config)=='selected','account_scope_not_committed')
@@ -93,7 +101,6 @@ def token(config):
         old=json.loads(legacy);old_receipt=read(old['receipt'])[0]
         need(sha(old_receipt)==old.get('receipt_sha256')==receipt.get('legacy_receipt_sha256')
              and json.loads(old_receipt).get('state')=='committed','legacy_scope_receipt_changed')
-    _pending(root)
     need(_optional(root/CURRENT)==current,'scope_mode_changed')
     return ('account',sha(current))
 
@@ -151,14 +158,21 @@ def _registry_snapshot(conn):
         snapshot.close();raise
 
 
+def registry_schema(conn):
+    version = state(conn, 'shard_anchor_schema')
+    need(type(version) is int and version in (1, 2), 'scope_registry_schema')
+    return version
+
+
 @contextlib.contextmanager
-def registry(config,*,write=False,initialize=False,snapshot=True):
+def registry(config,*,write=False,initialize=False,snapshot=True,validated=None):
     need(mode(config)=='account','account_scope_required');before=None if write else query_scope_guard(config);root=Path(config['mirror_root']);path=root/REGISTRY
     # Same protected-directory checks as immutable existing scope transactions.
     from .native_scope_add import directory
     with directory(root):pass
     if initialize:
         fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.close(fd)
+    if any((root/name).exists() or (root/name).is_symlink() for name in ('.registry-reuse.pending.json','.registry-reuse.retry.json')):raise MirrorError('registry_migration_pending')
     identity=_safe(path)
     conn=sqlite3.connect(str(path) if write else readonly_database_uri(path),uri=not write,timeout=.1)
     try:
@@ -169,25 +183,34 @@ def registry(config,*,write=False,initialize=False,snapshot=True):
                 'CREATE TABLE state(key TEXT PRIMARY KEY,value TEXT NOT NULL);')
             conn.execute('INSERT INTO binding VALUES(?)',(json.dumps(fixed(config),sort_keys=True),))
             conn.execute('INSERT INTO state VALUES(?,?)',('shard_anchor_schema','1'));conn.commit()
-        need(conn.execute('SELECT value FROM binding').fetchall()==[(json.dumps(fixed(config),sort_keys=True),)],'scope_registry_binding')
-        need(state(conn,'shard_anchor_schema')==1,'scope_registry_schema')
+        from . import native_registry_reuse as reuse
+        storage=reuse.descriptor(config,conn)
+        if storage is not None:reuse.validate_history(config,conn,_value=storage)
+        registry_schema(conn)
         if not write and snapshot:
             copied=_registry_snapshot(conn);conn.close();conn=copied
-            need(conn.execute('SELECT value FROM binding').fetchall()==[(json.dumps(fixed(config),sort_keys=True),)],'scope_registry_binding')
-            need(state(conn,'shard_anchor_schema')==1,'scope_registry_schema')
+            storage=reuse.descriptor(config,conn)
+            if storage is not None:reuse.validate_history(config,conn,_value=storage)
+            registry_schema(conn)
         if not write:conn.execute('PRAGMA query_only=ON');conn.execute('BEGIN')
-        yield conn
+        if validated is not None:validated(identity)
+        if write:yield conn
+        else:
+            with reuse.reading():yield conn
         need(_safe(path)==identity,'scope_registry_replaced')
         if not write:
             query_scope_guard(config,before)
             fresh=sqlite3.connect(readonly_database_uri(path),uri=True,timeout=.1)
             try:
                 fresh.execute('PRAGMA query_only=ON')
-                need(fresh.execute('SELECT value FROM binding').fetchall()==[(json.dumps(fixed(config),sort_keys=True),)],'scope_registry_binding')
-                need(state(fresh,'shard_anchor_schema')==1,'scope_registry_schema')
+                storage=reuse.descriptor(config,fresh)
+                if storage is not None:reuse.validate_history(config,fresh,_value=storage)
+                registry_schema(fresh)
             finally:fresh.close()
             need(_safe(path)==identity,'scope_registry_replaced');query_scope_guard(config,before)
-    finally:conn.close()
+    finally:
+        from .native_registry_reuse import forget
+        forget(conn);conn.close()
 
 def state(conn,key,default=None):
     row=conn.execute('SELECT value FROM state WHERE key=?',(key,)).fetchone()
@@ -218,7 +241,8 @@ def _register_members(config,conn,observation,members):
     if prior_anchor is None:
         need(conn.execute('SELECT 1 FROM members WHERE shard=? LIMIT 1',(observation['shard'],)).fetchone() is None,'scope_shard_anchor_missing')
         save(conn,'shard_anchor:'+observation['shard'],anchor)
-    obs_id=digest(observation);conn.execute('INSERT OR IGNORE INTO observations VALUES(?,?)',(obs_id,json.dumps(observation,sort_keys=True)))
+    from . import native_registry_reuse as reuse
+    obs_id=reuse.store(config,conn,observation)
     for item in members:
         table=item['table'];need(TABLE.fullmatch(table) and [table,item['schema_sha256']] in observation['tables'],'scope_member_invalid')
         old=conn.execute('SELECT proof FROM members WHERE shard=? AND table_name=?',(observation['shard'],table)).fetchone()
@@ -227,12 +251,33 @@ def _register_members(config,conn,observation,members):
             prior=json.loads(old[0]);need(all(prior.get(k)==proof.get(k) for k in ('source_identity','header','schema_sha256')),'scope_source_conflict')
             need(prior.get('username') in (None,proof.get('username')),'conversation_identity_conflict')
         conn.execute('INSERT OR REPLACE INTO members VALUES(?,?,?)',(observation['shard'],table,json.dumps(proof,sort_keys=True)))
+    reuse.prune(config,conn)
 
-def member(config,conn,shard,table):
+def member(config,conn,shard,table,*,_observations=None,_budget=None):
+    if _budget is not None:
+        from .native_account_copy_init import charge
+        charge(_budget,16)
+        size=conn.execute('SELECT length(CAST(proof AS BLOB)) FROM members WHERE shard=? AND table_name=?',(shard,table)).fetchone();need(size is not None,'scope_table_unregistered');charge(_budget,size[0])
     row=conn.execute('SELECT proof FROM members WHERE shard=? AND table_name=?',(shard,table)).fetchone();need(row is not None,'scope_table_unregistered')
-    proof=json.loads(row[0]);obs=conn.execute('SELECT proof FROM observations WHERE id=?',(proof.get('observation'),)).fetchone()
-    need(obs is not None,'scope_member_proof');observation=json.loads(obs[0])
-    need(digest(observation)==proof['observation'] and observation.get('contract')==fixed(config)
+    if _budget is not None:need(len(row[0].encode())==size[0],'scope_member_proof')
+    proof=json.loads(row[0])
+    observation_id = proof.get('observation')
+    need(type(observation_id) is str, 'scope_member_proof')
+    # Share proof checks only within one stable reader transaction, never across rounds.
+    observation = _observations.get(observation_id) if _observations is not None else None
+    if observation is None:
+        from . import native_registry_reuse as reuse
+        if _budget is not None:
+            charge(_budget,16);observed_size=reuse.observation_size(config,conn,observation_id);need(type(observed_size)is int and observed_size>=0,'scope_member_proof');charge(_budget,observed_size)
+        observation = reuse.observation(config,conn,observation_id)
+        need(digest(observation) == observation_id, 'scope_member_proof')
+        if _observations is not None and len(json.dumps(observation).encode()) <= 1024 * 1024:
+            if len(_observations) == 32:
+                _observations.popitem(last=False)
+            _observations[observation_id] = observation
+    else:
+        _observations.move_to_end(observation_id)
+    need(observation.get('contract')==fixed(config)
          and observation.get('shard')==shard and observation.get('query_only') is True
          and [table,proof.get('schema_sha256')] in observation.get('tables',[])
          and proof.get('source_identity')==observation.get('source_identity') and proof.get('header')==observation.get('header')
@@ -248,14 +293,18 @@ def authorized(config,username=None,*,shard=None,table=None):
         if shard is not None:
             proof=member(config,conn,shard,table);need(username is None or proof.get('username')==username,'scope_not_authorized');return proof
         need(type(username) is str and username,'scope_not_authorized')
+        from collections import OrderedDict
+        observations=OrderedDict()  # This registry read transaction only.
         rows=conn.execute('SELECT shard,table_name FROM members').fetchall()
-        need(any(member(config,conn,s,t).get('username')==username for s,t in rows),'scope_not_authorized')
+        need(any(member(config,conn,s,t,_observations=observations).get('username')==username for s,t in rows),'scope_not_authorized')
 
 def selection(config,username=None,ref=None):
     before=query_scope_guard(config)
     with registry(config) as conn:
+        from collections import OrderedDict
+        observations=OrderedDict()  # Never shared with another call or round.
         rows=conn.execute('SELECT shard,table_name FROM members ORDER BY shard,table_name').fetchall()
-        selected=[(s,t,member(config,conn,s,t)) for s,t in rows if (ref is None or target_ref(config,s,t)==ref)]
+        selected=[(s,t,member(config,conn,s,t,_observations=observations)) for s,t in rows if (ref is None or target_ref(config,s,t)==ref)]
         selected=[v for v in selected if ref is not None or v[2].get('username')==username]
         need(selected,'scope_not_authorized')
     query_scope_guard(config,before);return selected
@@ -265,12 +314,28 @@ _register(mode,fixed,binding,limited,token,query_scope_guard,loaded_scope_guard,
 
 
 def account_status(config,*,offset=0,limit=100,include_targets=False,_writer_locked=False):
+    # Independent bounded check. Its failure cannot reclassify a prior committed
+    # Source round; this endpoint retains all original limits and guards.
+    from .native_account_round import Evidence
+    evidence=Evidence();started=_time.monotonic();reason='status_failed'
+    try:
+        result=_account_status(config,offset=offset,limit=limit,include_targets=include_targets,_writer_locked=_writer_locked)
+        reason='status_returned';return result
+    except MirrorError as error:
+        if error.args and error.args[0] in ('registry_reuse_read_budget','local_registry_snapshot_budget','schedule_deadline_expired'):
+            reason='status_budget_or_timeout'
+        raise
+    finally:
+        evidence.add('independent_status',reason,duration_ms=max(0,int((_time.monotonic()-started)*1000)))
+
+
+def _account_status(config,*,offset=0,limit=100,include_targets=False,_writer_locked=False):
     """Read local metadata. Only an owning writer may keep a direct read transaction."""
     from .native_deadline import Deadline, _current, check_deadline
     before=query_scope_guard(config)
     deadline=_current.get() if _writer_locked else None
     need(type(offset) is int and offset>=0 and type(limit) is int and 1<=limit<=1000,'scope_pagination')
-    targets=[];counts=dict(registered=0,copied=0,raw_complete=0,identity_unknown=0,unsupported=0)
+    targets=[];counts=dict(registered=0,copied=0,raw_complete=0,current_H_complete=0,prior_coverage_unknown=0,identity_unknown=0,unsupported=0)
     gaps=[];watermarks=[]
     root=Path(config['mirror_root'])
     with registry(config,snapshot=not _writer_locked) as db:
@@ -279,6 +344,7 @@ def account_status(config,*,offset=0,limit=100,include_targets=False,_writer_loc
             _registry_page_size(db)
         roster=state(db,'roster',[]);inventory=[]
         last=state(db,'last_attempt',{});gaps+=last.get('gaps',[])
+        unknown={(s,t) for s,t in db.execute("SELECT json_extract(value,'$.shard'),json_extract(value,'$.table') FROM state WHERE (key GLOB 'copy_init:*' OR key GLOB 'copy_init_done:*') AND json_extract(value,'$.prior_coverage_unknown')=1")}
         local_progress={}
         for shard in roster:
             # Check the clocks during the local scan. The enclosing status call
@@ -300,35 +366,46 @@ def account_status(config,*,offset=0,limit=100,include_targets=False,_writer_loc
                 local_progress[shard]=progress_by_table
             finally:conn.close()
         inventory_complete=bool(roster) and all(v.get('complete') is True for v in inventory)
+        observations = OrderedDict()
         for shard,table in db.execute('SELECT shard,table_name FROM members ORDER BY shard,table_name'):
             if deadline is not None and counts['registered']%64==0:Deadline.check(deadline)
-            proof=member(config,db,shard,table);counts['registered']+=1
+            proof=member(config,db,shard,table,_observations=observations);counts['registered']+=1
             if proof.get('username') is None:counts['identity_unknown']+=1
             if not proof.get('supported'):counts['unsupported']+=1;gaps.append('unsupported_message_schema')
             if proof.get('available') is False:gaps.append('source_table_missing')
             progress=local_progress.get(shard,{}).get(table)
-            complete=False
+            from .native_table_cursor import PENDING, pending
+            cursor_paused = pending(db,shard,table) is not None
+            if cursor_paused:gaps.append(PENDING)
+            prior_unknown=(shard,table) in unknown or bool(progress and progress.get('prior_coverage_unknown'))
+            if prior_unknown:counts['prior_coverage_unknown']+=1;gaps.append('prior_history_coverage_unknown')
+            complete=current_complete=False
             if progress:
                 need(progress.get('source_identity')==proof['source_identity'] and progress.get('source_header_sha256')==proof['header'],'scope_copy_proof')
                 counts['copied']+=1
-                complete=bool(type(progress.get('target')) is int and progress.get('history_complete') and progress['history']>=progress['H'] and progress['tail']>=progress['target'])
+                current_complete=bool(not cursor_paused and not progress.get('initial_suffix_pending') and type(progress.get('target')) is int and progress.get('history_complete') and progress['history']>=progress['H'] and progress['tail']>=progress['target'])
+                if current_complete:counts['current_H_complete']+=1
+                complete=current_complete and not prior_unknown
                 if complete:counts['raw_complete']+=1
                 watermarks.append(progress.get('checked_at'))
             if include_targets and offset<=counts['registered']-1<offset+limit:
-                targets.append(dict(target_ref=proof['ref'],username=proof.get('username'),identity_status='resolved' if proof.get('username') else 'unknown',shard=shard,table=table,copied=progress is not None,raw_complete=complete,supported=proof.get('supported') is True))
+                targets.append(dict(target_ref=proof['ref'],username=proof.get('username'),identity_status='resolved' if proof.get('username') else 'unknown',shard=shard,table=table,copied=progress is not None,raw_complete=complete,current_H_complete=current_complete,prior_coverage_unknown=prior_unknown,supported=proof.get('supported') is True))
     from .native_media_work import backfill_status
     media_backfill=backfill_status(config)
     query_scope_guard(config,before)
     if _writer_locked:
         check_deadline()
     raw_complete=bool(inventory_complete and counts['registered'] and counts['raw_complete']==counts['registered'] and not counts['unsupported'] and not gaps)
+    current_complete=bool(inventory_complete and counts['registered'] and counts['current_H_complete']==counts['registered'] and not counts['unsupported'] and not (set(gaps)-{'prior_history_coverage_unknown'}))
     return dict(scope_mode='account',account_authorized=True,contract_id=config[ID],inventory_complete=inventory_complete,
         inventory_refresh_requested_shards=sum(v.get('refresh_requested') is True for v in inventory),inventory_evidence='last_bounded_stable_pass_not_atomic_current_source',
-        counts=counts,raw_messages_complete=raw_complete,identity_complete=counts['identity_unknown']==0,
-        known_backlog=not raw_complete,last_full_observation=min((v.get('checked_at_ns',0) for v in inventory),default=None) if inventory_complete else None,
+        counts=counts,raw_messages_complete=raw_complete,current_snapshot_complete=current_complete,prior_coverage_unknown=bool(counts['prior_coverage_unknown']),identity_complete=counts['identity_unknown']==0,
+        known_backlog=not current_complete,last_full_observation=min((v.get('checked_at_ns',0) for v in inventory),default=None) if inventory_complete else None,
         copied_as_of=min((n for n in watermarks if type(n) is int),default=None),atomic_global_snapshot=False,
         recent_coverage='not_proven_by_history_tail',media_complete='separate_worker_status',media_backfill=media_backfill,gaps=sorted(set(gaps)),targets=targets,offset=offset,limit=limit,
         next_offset=offset+limit if offset+limit<counts['registered'] else None,source_opens=0)
+
+_register(account_status,_account_status)
 
 # ---------------------------------------------------------------------------
 # Account-mode source re-anchor after a verified same-source device-number
@@ -473,9 +550,8 @@ def reanchor_sources(config, conn, *, grant):
                            header=live_header, query_only=True, schema_cookie=None,
                            at_ns=_time.time_ns(),
                            tables=[[t, proof['schema_sha256']] for t, proof in member_proofs])
-        obs_id = digest(observation)
-        conn.execute('INSERT OR IGNORE INTO observations VALUES(?,?)',
-                     (obs_id, json.dumps(observation, sort_keys=True)))
+        from . import native_registry_reuse as reuse
+        obs_id = reuse.store(config,conn,observation)
         for table_name, proof in member_proofs:
             proof['source_identity'] = live_identity
             proof['header'] = live_header
@@ -485,6 +561,8 @@ def reanchor_sources(config, conn, *, grant):
         save(conn, key, dict(source_identity=live_identity, header=live_header))
         changes[shard] = dict(prior_identity=prior_identity, prior_header=prior_header,
                               new_identity=live_identity, new_header=live_header)
+    from .native_registry_reuse import prune
+    prune(config,conn)
     # Phase 3: local __walden_progress metadata update (same-source, idempotent).
     # The synchronizer validates progress.source_identity against the live identity
     # at its copy step (native_mirror_sync.py:342-343 / :660) and raises
@@ -517,7 +595,8 @@ def reanchor_sources(config, conn, *, grant):
                                 unchanged=len([s for s in live if s not in changes])))
     save(conn, 'source_reanchor_receipt:' + nonce, receipt)
     try:
-        conn.commit()
+        from .native_registry_reuse import commit
+        commit(config,conn)
     except Exception:
         conn.rollback()
         raise

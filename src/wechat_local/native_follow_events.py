@@ -9,6 +9,7 @@ import select
 import stat
 from .native_mirror_store import MirrorError
 from .native_deadline import continuous_ns
+from .source_catalog import SHARD_NAME_PATTERN
 
 
 def _continuous_seconds():
@@ -29,6 +30,9 @@ class VnodeHints:
         self.fds = {}
         self.identity = None
         self.generation = 1  # Startup/restart always reconciles once.
+        self.shard_generations = {}
+        self.fallback_generation = 0
+        self.uncertain_generation = 1
         self.conflict = False
         self.last_wait = clock()
         try:
@@ -36,6 +40,21 @@ class VnodeHints:
         except BaseException:
             self.close()
             raise
+
+    def _data_shard(self,path):
+        if path.parent!=self.root:return None
+        name=path.name
+        if name.endswith('.db-wal'):name=name[:-4]
+        elif not name.endswith('.db'):return None
+        return name if SHARD_NAME_PATTERN.fullmatch(name) else None
+
+    def _publish(self,changed,unknown=False,*,uncertain=None):
+        uncertain=unknown if uncertain is None else uncertain
+        if len(set(self.shard_generations)|changed)>64:
+            self.shard_generations.clear();unknown=True;uncertain=True
+        else:self.shard_generations.update({name:self.generation for name in changed})
+        if unknown:self.fallback_generation=self.generation
+        if uncertain:self.uncertain_generation=self.generation
 
     def _refresh(self):
         # Every lookup/open is relative to an already opened directory FD.
@@ -47,6 +66,8 @@ class VnodeHints:
         links = []
         fresh = {}
         old_paths = {path for path, _ in self.fds.values()}
+        old_entries={(path,stamp):fd for fd,(path,stamp) in self.fds.items()}
+        initialized=self.identity is not None
         def identity(info):
             return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
         def open_child(parent, name, flags, label):
@@ -95,20 +116,36 @@ class VnodeHints:
                         fresh[child] = (child_label, (current.st_dev, current.st_ino))
             visit(root_fd, self.root)
             validate()
+            # Keep unchanged subscriptions alive. Closing and re-registering
+            # them could lose a DB/WAL event queued during this refresh.
+            reuse={}
+            discovered=set()
+            for fd,(path,stamp) in fresh.items():
+                old=old_entries.get((path,stamp))
+                if old is not None:
+                    if identity(os.fstat(old))!=identity(os.fstat(fd)):
+                        raise MirrorError('follow_event_path_changed')
+                    reuse[fd]=old
+                elif initialized:
+                    name=self._data_shard(path)
+                    if name is not None:discovered.add(name)
             b = self.backend
             flags = b.KQ_NOTE_WRITE | b.KQ_NOTE_DELETE | b.KQ_NOTE_RENAME | b.KQ_NOTE_ATTRIB | b.KQ_NOTE_EXTEND | b.KQ_NOTE_REVOKE
             for fd in fresh:
+                if fd in reuse:continue
                 event = b.kevent(fd, filter=b.KQ_FILTER_VNODE,
                                  flags=b.KQ_EV_ADD | b.KQ_EV_ENABLE | b.KQ_EV_CLEAR, fflags=flags)
                 self.queue.control([event], 0, 0)
             validate()
+            accepted={reuse.get(fd,fd):entry for fd,entry in fresh.items()}
             for fd in self.fds:
-                os.close(fd)
-            self.fds = fresh
+                if fd not in accepted:os.close(fd)
+            self.fds = accepted
             self.identity = root_identity
+            self._publish(discovered)
             # Ancestors are traversal anchors only, never watched outside root.
             for fd in opened:
-                if fd not in fresh:
+                if fd not in self.fds:
                     os.close(fd)
             opened.clear()
         finally:
@@ -128,6 +165,7 @@ class VnodeHints:
             now = self.clock()
             if now - self.last_wait > timeout + 5:
                 self.generation += 1
+                self.uncertain_generation=self.generation
             self.last_wait = now
             if events:
                 self.generation += 1
@@ -140,6 +178,25 @@ class VnodeHints:
                 error_flag = getattr(self.backend, 'KQ_EV_ERROR', 0)
                 if any(getattr(event, 'flags', 0) & error_flag for event in events + tail):
                     raise MirrorError('follow_native_event_delivery_error')
+                # Resolve old descriptor identities before _refresh closes them.
+                changed = set()
+                coordination = set()
+                unknown = len(events) == 256 or len(tail) == 256
+                for event in events + tail:
+                    entry = self.fds.get(getattr(event, 'ident', None))
+                    if entry is None or entry[0].parent != self.root:
+                        unknown = True
+                        continue
+                    name=self._data_shard(entry[0])
+                    if name is not None:
+                        changed.add(name)
+                    elif entry[0].name.endswith('.db-shm') and SHARD_NAME_PATTERN.fullmatch(entry[0].name[:-4]):
+                        coordination.add(entry[0].name[:-4])
+                    else:unknown=True
+                # SHM coordinates readers/writers; it is not message content.
+                # Keep it dirty and discover conservatively without repeatedly
+                # placing that shard ahead of all ordinary/history sources.
+                self._publish(changed,unknown or bool(coordination-changed),uncertain=unknown)
                 self._refresh()
             return self.generation
         except (OSError, MirrorError):

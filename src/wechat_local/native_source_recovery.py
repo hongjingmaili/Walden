@@ -209,6 +209,8 @@ def plan(config):
             cap=next((int(r[0].split('=')[1]) for r in c.execute('PRAGMA compile_options') if r[0].startswith('MAX_ATTACHED=')),10)
             need(len(sources)-1<=cap,'atomic_attach_limit')
             c.execute('BEGIN');binding=c.execute('SELECT * FROM __walden_binding').fetchall();need(binding==[(anchor['account_id'],anchor['source_generation'],path.name)],'binding_changed')
+            need(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='__walden_cursor_epochs'").fetchone() is None,
+                 'account_source_recovery_requires_registry_proof')
             names=[r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__walden_%' ORDER BY name")]
             if kind=='message':need(set(names)-{'Name2Id'}<=expected,'unscoped_local_table');tables=[t for t in names if t in expected]
             else:tables=names

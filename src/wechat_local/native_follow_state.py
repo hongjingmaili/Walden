@@ -1,6 +1,7 @@
 """Follow decision rules; OS facts and Source I/O stay at their existing edges."""
 from copy import deepcopy
 import uuid
+from .native_follow_schedule import plan,partial_completion
 
 
 def _completed(worker, policy_generation, epoch):
@@ -32,7 +33,7 @@ def transition(previous, *, enabled, policy_generation, app, worker, wall, conti
     stop = 'stop' if active else 'wait'
     if r.get('policy_generation') not in (None, policy_generation):
         r.update(app_epoch=None, verified_app_epoch=None, app_was_running=False, drain=None,
-                 observed_catchup_complete=None, observed_as_of=None)
+                 observed_catchup_complete=None, observed_as_of=None, source_schedule=None)
         if active:
             r.update(policy_generation=policy_generation, state='stopping', action='stop')
             return r
@@ -50,6 +51,20 @@ def transition(previous, *, enabled, policy_generation, app, worker, wall, conti
         if done['exit_code'] == 0:
             r['verified_app_epoch'] = deepcopy(old_epoch)
             r['observed_catchup_complete'] = worker.get('observed_complete')
+        else:
+            r['source_schedule'] = plan(r.get('source_schedule'), wall=wall, continuous=continuous,
+                                        interval=retry_seconds, completion=done)
+    schedule = r.get('source_schedule') or {}
+    if schedule.get('mode') in ('backoff','blocked'):
+        schedule = plan(schedule, wall=wall, continuous=continuous, interval=retry_seconds)
+        r['source_schedule'] = schedule
+        if not schedule['due']:
+            if app['state'] == 'absent':
+                # An exit observed during cooldown cannot become a later drain grant.
+                r.update(app_was_running=False, drain=None)
+            reason = schedule.get('failure_reason') if schedule['mode'] == 'blocked' else 'source_retry_backoff'
+            r.update(state='waiting_source', action=stop, pending_reasons=[reason or 'source_contract_blocked'])
+            return r
     if app['state'] == 'running':
         epoch = app['epoch']
         if epoch != old_epoch:
@@ -62,14 +77,16 @@ def transition(previous, *, enabled, policy_generation, app, worker, wall, conti
             return r
         if _completed(worker, policy_generation, epoch):
             done = worker['last_completed']
-            if done['exit_code']:
-                key = [done['operation'], done['attempt']]
-                if r.get('failed_completion') != key:
-                    r.update(failed_completion=key, retry_after_ns=continuous + int(retry_seconds*1e9))
-                if continuous < r.get('retry_after_ns', 0):
-                    r.update(state='waiting_source', action=stop)
-                    return r
-            else:
+            if partial_completion(done) and active:
+                from .native_table_cursor import PENDING
+                source = done['partial_source']
+                reasons = []
+                if source['retrying_shards']:reasons.append('source_shard_retry_pending')
+                if 'paused_tables' in source:reasons.append(PENDING)
+                r.update(state='partial_source',observed_catchup_complete=None,
+                         pending_reasons=reasons,catchup_pending=True)
+                return r
+            if done['exit_code']==0:
                 r['verified_app_epoch'] = deepcopy(epoch)
                 r['observed_catchup_complete'] = worker.get('observed_complete')
                 if active:

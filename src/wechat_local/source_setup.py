@@ -1,7 +1,7 @@
 """Resolve one explicitly selected WeChat account root into current-source paths.
 
-Voice discovery inspects schema metadata. Successful first setup separately
-invokes the ordinary bounded window entry to prepare its initial baseline.
+Voice discovery inspects schema metadata. Plain setup only writes configuration;
+confirmed onboarding also initializes a copy and enables the existing follower.
 """
 
 from __future__ import annotations
@@ -462,8 +462,14 @@ def prepare_account_source(
     confirm_self_username: str | None = None,
     query_timezone: str | None = None,
     mirror_scope: list[str] | None = None,
+    mirror_scope_mode: str = "selected",
+    _onboarding_contract_id: str | None = None,
     _capture_observations: dict | None = None,
 ) -> dict[str, Any]:
+    if _onboarding_contract_id is not None and (mirror_scope_mode != "account" or not isinstance(_onboarding_contract_id, str) or re.fullmatch("[0-9a-f]{32}", _onboarding_contract_id) is None):
+        return {"status": "mirror_scope_invalid"}
+    if mirror_scope_mode not in {"selected", "account"} or (mirror_scope_mode == "account" and mirror_scope is not None):
+        return {"status": "mirror_scope_invalid"}
     if mirror_scope is not None and (not isinstance(mirror_scope, list) or not mirror_scope or any(not isinstance(u, str) or not u.strip() or u.strip() != u for u in mirror_scope) or len(set(mirror_scope)) != len(mirror_scope)):
         return {'status': 'mirror_scope_invalid'}
     if mirror_scope is not None:
@@ -668,6 +674,11 @@ def prepare_account_source(
     if mirror_scope is not None:
         profile['mirror_scope'] = list(mirror_scope)
         profile['mirror_root'] = str(stores / 'native-mirrors' / profile['account_id'] / profile['source_generation'])
+    if mirror_scope_mode == "account":
+        profile.update(mirror_scope_mode="account", scope_contract_id=_onboarding_contract_id or uuid.uuid4().hex,
+                       mirror_root=str(stores / "native-mirrors" / profile["account_id"] / profile["source_generation"]))
+        from .native_scope_contract import fixed
+        fixed(profile)
     if query_timezone is not None:
         profile["query_timezone"] = query_timezone
     if confirm_self_username is not None:
@@ -978,7 +989,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="Configure one explicit WeChat account root and authorized native scope. Setup writes a private profile only; run wechat-local-sync init separately. Fresh native setup does not produce existing-evidence reply materializations.")
+    parser = argparse.ArgumentParser(description="Configure one explicit WeChat account root and authorized native scope. By default setup writes a private profile only. --start-sync --confirmed also initializes and enables continuous background synchronization. Fresh native setup does not produce existing-evidence reply materializations.")
     parser.add_argument("--account-root", type=Path)
     parser.add_argument("--confirm-self-username", help="stable username explicitly confirmed by the user for this source")
     parser.add_argument("--replace-self-identity", action="store_true", help="explicitly correct/rebind an existing saved identity")
@@ -992,14 +1003,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-home", type=Path)
     parser.add_argument("--mirror-username", dest="mirror_scope", action="append", help="explicit stable username authorized for native init; repeat for each scope")
     parser.add_argument("--timezone", help="explicit IANA query timezone saved for native windows")
+    parser.add_argument("--start-sync", action="store_true", help="initialize the authorized copy and enable continuous background sync")
+    parser.add_argument("--confirmed", action="store_true", help="user confirmed this account, exact scope and continuous background sync")
+    parser.add_argument("--account-scope", action="store_true", help="explicitly authorize whole-account scope; requires --start-sync")
     args = parser.parse_args(argv)
+    if args.start_sync:
+        from .native_onboarding import start
+        result = start(args, configure=lambda: _configure(args))
+    elif args.confirmed or args.account_scope:
+        result = {"status": "onboarding_arguments_invalid"}
+    else:
+        result = _configure(args)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["status"] in {"configured", "configured_with_voice_incomplete", "self_identity_confirmed", "onboarding_complete"} else 2
+
+
+def _configure(args):
+    import sys
     target_options = (args.wechat_executable, args.wechat_data_home, args.lldb_executable)
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     output_data_home = args.data_home or Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     config_path = args.config or config_home / "wechat-local" / "current-source.json"
-    if args.account_root is not None and not args.mirror_scope:
-        print(json.dumps({'status': 'mirror_scope_required'}, sort_keys=True))
-        return 2
+    if args.account_root is not None and not args.mirror_scope and not args.account_scope:
+        return {'status': 'mirror_scope_required'}
     if args.mirror_scope is not None:
         try:
             if len(set(args.mirror_scope)) != len(args.mirror_scope):
@@ -1007,65 +1033,54 @@ def main(argv: list[str] | None = None) -> int:
             for username in args.mirror_scope:
                 _validate_mirror_username(username)
         except SourceSetupError:
-            print(json.dumps({'status': 'mirror_scope_invalid'}, sort_keys=True))
-            return 2
+            return {'status': 'mirror_scope_invalid'}
     if args.timezone is not None:
         try:
             ZoneInfo(args.timezone)
         except (ZoneInfoNotFoundError, ValueError):
-            print(json.dumps({'status': 'query_timezone_invalid'}, sort_keys=True))
-            return 2
+            return {'status': 'query_timezone_invalid'}
     if args.confirm_self_username is not None:
         try:
             _validate_self_username(args.confirm_self_username)
         except SourceSetupError as exc:
-            print(json.dumps({"status": str(exc)}, sort_keys=True))
-            return 2
+            return {"status": str(exc)}
     if args.account_root is None:
         if args.confirm_self_username is None or (
             args.acquire_passphrase or args.passphrase_file is not None or args.data_home is not None
             or any(item is not None for item in target_options) or args.capture_timeout is not None or args.mirror_scope is not None or args.timezone is not None
         ):
-            print(json.dumps({"status": "identity_update_arguments_invalid"}, sort_keys=True))
-            return 2
+            return {"status": "identity_update_arguments_invalid"}
         try:
             result = confirm_source_identity(config_path, args.confirm_self_username, replace=args.replace_self_identity)
         except SourceSetupError as exc:
             result = {"status": str(exc)}
-        print(json.dumps(result, sort_keys=True))
-        return 0 if result["status"] == "self_identity_confirmed" else 2
+        return result
     if args.replace_self_identity:
-        print(json.dumps({"status": "identity_update_arguments_invalid"}, sort_keys=True))
-        return 2
+        return {"status": "identity_update_arguments_invalid"}
     if args.acquire_passphrase:
         supplied_target_options = sum(item is not None for item in target_options)
         if args.passphrase_file is not None or supplied_target_options not in {0, 3}:
-            print(json.dumps({"status": "acquisition_arguments_invalid"}, sort_keys=True))
-            return 2
+            return {"status": "acquisition_arguments_invalid"}
         if args.capture_timeout is not None and (
             not math.isfinite(args.capture_timeout) or args.capture_timeout < 0 or args.capture_timeout > 300
         ):
-            print(json.dumps({"status": "capture_timeout_invalid"}, sort_keys=True))
-            return 2
+            return {"status": "capture_timeout_invalid"}
         preflight_error = _preflight_capture_outputs(args.account_root, config_path, output_data_home)
         if preflight_error is not None:
-            print(json.dumps({"status": preflight_error}, ensure_ascii=False, sort_keys=True))
-            return 2
+            return {"status": preflight_error}
         if supplied_target_options == 0:
             from .credential_capture import resolve_default_capture_inputs
 
             resolved = resolve_default_capture_inputs(args.account_root)
             if resolved.get("status") != "resolved":
-                print(json.dumps(resolved, ensure_ascii=False, sort_keys=True))
-                return 2
+                return resolved
             target_options = (
                 Path(str(resolved["wechat_executable"])),
                 Path(str(resolved["wechat_data_home"])),
                 Path(str(resolved["lldb_executable"])),
             )
     elif any(item is not None for item in target_options) or args.capture_timeout is not None:
-        print(json.dumps({"status": "acquisition_arguments_invalid"}, sort_keys=True))
-        return 2
+        return {"status": "acquisition_arguments_invalid"}
     executable = Path(sys.argv[0]).resolve(strict=False)
     venv_bin = executable.parent
     window_cli = venv_bin / "wechat-local-window"
@@ -1076,8 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_file() or not os.access(path, os.X_OK)
     ]
     if missing_entrypoints:
-        print(json.dumps({"status": "entrypoint_missing", "missing": missing_entrypoints}, sort_keys=True))
-        return 2
+        return {"status": "entrypoint_missing", "missing": missing_entrypoints}
     passphrase_file = args.passphrase_file
     captured_identity: tuple[int, int] | None = None
     capture_observations: dict = {}
@@ -1097,8 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if captured.get("status") != "captured_and_verified":
             captured.pop("_passphrase_identity", None)
-            print(json.dumps(captured, ensure_ascii=False, sort_keys=True))
-            return 2
+            return captured
         passphrase_file = Path(str(captured["passphrase_file"]))
         captured_identity = captured.pop("_passphrase_identity", None)
         if not isinstance(captured_identity, tuple) or len(captured_identity) != 2:
@@ -1106,8 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
 
             _unlink_owned(passphrase_file, None)
             capture_observations.clear()
-            print(json.dumps({"status": "credential_save_failed"}, sort_keys=True))
-            return 2
+            return {"status": "credential_save_failed"}
     captured_parent_identity = capture_observations.get('credential_parent_identity')
     try:
         result = prepare_account_source(
@@ -1120,11 +1132,21 @@ def main(argv: list[str] | None = None) -> int:
             reply_cli=reply_cli,
             confirm_self_username=args.confirm_self_username,
             mirror_scope=args.mirror_scope,
+            mirror_scope_mode="account" if args.account_scope else "selected",
+            _onboarding_contract_id=getattr(args, "_onboarding_contract_id", None),
             **({'query_timezone': args.timezone} if args.timezone is not None else {}),
             _capture_observations=capture_observations if args.acquire_passphrase else None,
         )
     except Exception as exc:
         result = {"status": "setup_failed", "error_type": type(exc).__name__}
+    except BaseException:
+        # Cancellation before profile publication must not strand this capture's
+        # exact owned credential and block the same automatic entry on retry.
+        if (args.acquire_passphrase and not config_path.exists() and not config_path.is_symlink()
+                and _owned_capture_parent(Path(str(passphrase_file)), captured_parent_identity)):
+            from .credential_capture import _unlink_owned
+            _unlink_owned(Path(str(passphrase_file)), captured_identity)
+        raise
     finally:
         capture_observations.clear()
     if args.acquire_passphrase:
@@ -1141,8 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
         result['next_step'] = 'init'
         # No source query or EventStore baseline in native setup.
         result['self_identity'] = {'status': 'confirmed' if args.confirm_self_username is not None else 'incomplete'}
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0 if result["status"] in {"configured", "configured_with_voice_incomplete"} else 2
+    return result
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from .source_setup import _confirmed_self_username
 from .live_readonly import readonly_database_uri
 from .native_mirror_store import MirrorError
 from .native_mirror_sync import mirror_root
+from . import native_table_cursor as cursor_recovery
 
 
 def _attempt_gaps(root, usernames):
@@ -118,6 +119,12 @@ def _request_range(config, root, username, request, states, ordered):
                 since=since, through=through, observation_id=proof['observation_id'])
 
 
+def _paused_targets(config, selections):
+    from .native_scope_contract import registry
+    with registry(config) as index:
+        return {(shard, table) for shard, table, _ in selections if cursor_recovery.pending(index, shard, table) is not None}
+
+
 def query_local(config, request, *, alias_context=None, transcriber=None, membership=None):
     from .native_scope_contract import query_scope_guard
     scope_token=query_scope_guard(config)
@@ -163,6 +170,7 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
         username = resolution['selected_username']
     authorized(config,username)
     account_selection=selection(config,username=username) if account else None
+    paused=_paused_targets(config,account_selection) if account else set()
     table = 'Msg_' + hashlib.md5(username.encode()).hexdigest()
     limit = int(request.get('limit', 100))
     offset = int(request.get('offset', 0))
@@ -190,6 +198,10 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
             if row is None:
                 continue
             state = json.loads(row[0])
+            if (path.name,table) in paused:
+                state['history_complete']=False
+                gaps.append(cursor_recovery.PENDING)
+            if state.get('initial_suffix_pending'):state['history_complete']=False
             if account:
                 proof=authorized(config,username,shard=path.name,table=table)
                 if state.get('source_identity')!=proof['source_identity'] or state.get('source_header_sha256')!=proof['header']:raise MirrorError('scope_copy_proof')
@@ -216,21 +228,21 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
             adapter.begin_scan()
             source_key = SourceKey(config['account_id'], config['source_generation'], path.name, table)
             columns = [item[1] for item in conn.execute('PRAGMA table_info(' + qi(table) + ')')]
-            predicate='';parameters=[request.get('start',-9223372036854775808),request.get('end',9223372036854775807)]
+            ids=None
             if membership is not None:
                 ids=membership.get(path.name,[])
                 if type(ids) is not list or len(ids)>501 or any(type(i) is not int or i<=0 for i in ids):raise MirrorError('request_membership_invalid')
                 predicate=' AND local_id IN ('+','.join('?' for _ in ids)+')' if ids else ' AND 0'
                 if ids and conn.execute('SELECT count(*) FROM '+qi(table)+predicate.replace(' AND ',' WHERE ',1),tuple(ids)).fetchone()[0]!=len(ids):raise MirrorError('request_cache_incomplete')
-                parameters+=ids
-            rows=conn.execute('SELECT * FROM '+qi(table)+' WHERE create_time>=? AND create_time<=?'+predicate+' ORDER BY create_time DESC,local_id DESC LIMIT ?',tuple(parameters+[limit+offset])).fetchall()
-            for row in rows:
+            rows=cursor_recovery.query_rows(conn,table,state,columns,request.get('start',-9223372036854775808),
+                                            request.get('end',9223372036854775807),limit+offset,ids)
+            for epoch,row in rows:
                 item = dict(zip(columns, row))
                 raw = item['message_content']
                 message = RawMessage(item['local_id'], item.get('server_id'), item['local_type'], item['create_time'], item['real_sender_id'], raw, item['WCDB_CT_message_content'], raw_source=item.get('source'), source_compression_type=item.get('WCDB_CT_source'))
                 fingerprint = _content_fingerprint(message)
                 expected = (str(message.server_id) if message.server_id is not None else None, message.local_type, message.create_time, message.real_sender_id, fingerprint)
-                observed = conn.execute('SELECT * FROM __walden_observed WHERE local_id=?', (message.local_id,)).fetchall()
+                observed = cursor_recovery.observed_rows(conn, message.local_id) if account else conn.execute('SELECT * FROM __walden_observed WHERE local_id=?', (message.local_id,)).fetchall()
                 if observed_association_conflict([(table, message.local_id, expected)], observed):
                     gaps.append('conversation_attribution_conflict')
                 revision = RawRevisionInput(fingerprint, 1, str(item['server_id']) if item.get('server_id') is not None else None, item['local_type'], item['create_time'], item['real_sender_id'], raw, 'text' if isinstance(raw, str) else 'blob' if raw is not None else 'null', item['WCDB_CT_message_content'], '2000-01-01T00:00:00.000000+00:00')
@@ -248,11 +260,13 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
                 parse_seconds += time.monotonic() - parse_start
                 messages.append(dict(local_id=item['local_id'], create_time=item['create_time'], sender_username=sender, text=text, content=dict(kind=kind, text=text, attributes=attrs, raw_text=decoded.text), quality_codes=sorted(quality), source=dict(account_id=config['account_id'], source_generation=config['source_generation'], shard=path.name, table=table, local_id=item['local_id'], content_sha256=fingerprint)))
                 current = messages[-1]
+                if epoch is not None:
+                    current['source']['table_generation'] = epoch
                 current['direction'] = direction
                 sender_name = adapter.sender_display_name(source_key, message)
                 current['sender_display_name'] = sender_name if sender_name and sender_name != sender else 'unknown'
                 current['source_facts'] = adapter.source_facts(source_key, message)
-                current['_media_identity'] = item
+                current['_media_identity'] = None if epoch is not None or (path.name,table) in paused else item
 
         finally:
             if contact_connection is not None:
@@ -260,7 +274,8 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
             conn.close()
     if not states:
         gaps.append('scope_not_copied')
-    messages.sort(key=lambda row: (type(row['create_time']) is int, row['create_time'] if type(row['create_time']) is int else 0, row['local_id'], row['source']['shard']), reverse=True)
+    if any(state.get('prior_coverage_unknown') for state in states):gaps.append('prior_history_coverage_unknown')
+    messages.sort(key=lambda row: (type(row['create_time']) is int, row['create_time'] if type(row['create_time']) is int else 0, row['local_id'], row['source']['shard'], row['source'].get('table_generation',0)), reverse=True)
     request_range = dict(status='unknown',reason='account_recent_vector_not_proven',as_of=None) if account else _request_range(config, root, username, request, observation_states, messages)
     if request_range['status'] != 'observed_vector_covered':
         if not all(state['history_complete'] for state in states):
@@ -276,6 +291,12 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
     image_ocr_engine = None
     for current in selected:
         item = current.pop('_media_identity')
+        if item is None:
+            if current['content']['kind']=='audio' and request.get('voice_transcripts'):
+                current['voice']=dict(status='pending',reason='cursor_generation_media_unavailable')
+            if current['content']['kind']=='image' and request.get('images'):
+                current['image']=dict(status='pending',reason='cursor_generation_media_unavailable')
+            continue
         if current['content']['kind'] == 'audio' and request.get('voice_transcripts'):
             from .native_mirror_media import local_voice
             current['voice'] = local_voice(config, root, current['source']['shard'], username, item, transcriber)
@@ -287,7 +308,7 @@ def query_local(config, request, *, alias_context=None, transcriber=None, member
             from .native_image_query import engine_identity, local_ocr
             if image_ocr_engine is None:image_ocr_engine=engine_identity(root)
             current['image'].update(local_ocr(config,current['source'],username,current['image'],engine=image_ocr_engine))
-    result = dict(selected_username=username, messages=selected, coverage=dict(history_complete=bool(states) and all(s['history_complete'] for s in states), rechecked_since=max((s['rechecked_since'] for s in states if type(s.get('rechecked_since')) is int), default=None), arbitrary_old_changes_verified=False, request_range=request_range, atomic_global_snapshot=False, history_progress=[dict(shard=shard, H=state['H'], history=state['history'], tail=state['tail'], target=state['target'], per_batch_checked_at=state['checked_at']) for shard, (state, _) in observation_states.items()]), synced_at_semantics='minimum_per_batch_checked_at_not_scope_completion', last_attempt_at=None, last_complete_observation_at=None, synced_at=min((s['checked_at'] for s in states), default=None), freshness='stale' if gaps else 'local_snapshot', gaps=sorted(set(gaps)), source_opens=0, parse_seconds=parse_seconds, elapsed_seconds=time.monotonic() - started)
+    result = dict(selected_username=username, messages=selected, coverage=dict(history_complete=bool(states) and all(s['history_complete'] and not s.get('prior_coverage_unknown') for s in states),prior_coverage_unknown=any(s.get('prior_coverage_unknown') for s in states), rechecked_since=max((s['rechecked_since'] for s in states if type(s.get('rechecked_since')) is int), default=None), arbitrary_old_changes_verified=False, request_range=request_range, atomic_global_snapshot=False, history_progress=[dict(shard=shard, H=state['H'], history=state['history'], tail=state['tail'], target=state['target'], per_batch_checked_at=state['checked_at']) for shard, (state, _) in observation_states.items()]), synced_at_semantics='minimum_per_batch_checked_at_not_scope_completion', last_attempt_at=None, last_complete_observation_at=None, synced_at=min((s['checked_at'] for s in states), default=None), freshness='stale' if gaps else 'local_snapshot', gaps=sorted(set(gaps)), source_opens=0, parse_seconds=parse_seconds, elapsed_seconds=time.monotonic() - started)
     if resolution is not None:
         result['resolution'] = resolution
     query_scope_guard(config)
@@ -303,6 +324,7 @@ def _query_table_ref(config,request):
     limit=request.get('limit',100);offset=request.get('offset',0)
     if type(limit) is not int or not 1<=limit<=1000 or type(offset) is not int or offset<0:raise MirrorError('invalid_pagination')
     messages=[];states=[];gaps=[]
+    paused=_paused_targets(config,selected)
     for shard,table,proof in selected:
         path=root/shard
         if not path.is_file():gaps.append('scope_not_copied');continue
@@ -315,29 +337,41 @@ def _query_table_ref(config,request):
             progress=conn.execute('SELECT value FROM __walden_progress WHERE table_name=?',(table,)).fetchone()
             if progress is None:gaps.append('scope_not_copied');continue
             state=json.loads(progress[0]);states.append(state)
+            if (shard,table) in paused:
+                state['history_complete']=False
+                gaps.append(cursor_recovery.PENDING)
             if state.get('source_identity')!=proof['source_identity'] or state.get('source_header_sha256')!=proof['header']:raise MirrorError('scope_copy_proof')
             columns=[r[1] for r in conn.execute('PRAGMA table_info('+qi(table)+')')]
-            rows=conn.execute('SELECT * FROM '+qi(table)+' WHERE create_time>=? AND create_time<=? ORDER BY create_time DESC,local_id DESC LIMIT ?',(request.get('start',-9223372036854775808),request.get('end',9223372036854775807),limit+offset)).fetchall()
-            for row in rows:
+            rows=cursor_recovery.query_rows(conn,table,state,columns,request.get('start',-9223372036854775808),
+                                            request.get('end',9223372036854775807),limit+offset)
+            for epoch,row in rows:
                 item=dict(zip(columns,row));raw=item['message_content'];message=RawMessage(item['local_id'],item.get('server_id'),item['local_type'],item['create_time'],item['real_sender_id'],raw,item['WCDB_CT_message_content'])
                 fingerprint=_content_fingerprint(message);expected=(str(message.server_id) if message.server_id is not None else None,message.local_type,message.create_time,message.real_sender_id,fingerprint)
-                observed=conn.execute('SELECT * FROM __walden_observed WHERE local_id=?',(message.local_id,)).fetchall()
+                observed=cursor_recovery.observed_rows(conn,message.local_id)
                 if observed_association_conflict([(table,message.local_id,expected)],observed):raise MirrorError('conversation_attribution_conflict')
                 revision=RawRevisionInput(fingerprint,1,str(message.server_id) if message.server_id is not None else None,message.local_type,message.create_time,message.real_sender_id,raw,'text' if isinstance(raw,str) else 'blob' if raw is not None else 'null',item['WCDB_CT_message_content'],'2000-01-01T00:00:00.000000+00:00')
                 decoded=_decode_raw_content(revision);quality=set(decoded.quality_codes);quality.add('conversation_identity_unresolved')
                 kind,text,attrs=_structured_content(item['local_type']&65535,decoded.text,quality)
                 source=dict(account_id=config['account_id'],source_generation=config['source_generation'],shard=shard,table=table,local_id=item['local_id'],content_sha256=fingerprint)
+                if epoch is not None:
+                    source['table_generation']=epoch
                 value=dict(local_id=item['local_id'],create_time=item['create_time'],sender_username=None,sender_display_name='unknown',direction='unknown',text=text,content=dict(kind=kind,text=text,attributes=attrs,raw_text=decoded.text),quality_codes=sorted(quality),source=source,target_ref=proof['ref'])
                 if kind in ('image','audio') and (request.get('images') or request.get('voice_transcripts')):
                     from .native_media_work import local_result
-                    value['media']=local_result(config,source) or dict(status='pending',reason='identity_or_attachment_unavailable')
+                    if epoch is not None or (shard,table) in paused:
+                        value['media']=dict(status='pending',reason='cursor_generation_media_unavailable')
+                    else:
+                        value['media']=local_result(config,source) or dict(status='pending',reason='identity_or_attachment_unavailable')
                 messages.append(value)
         finally:conn.close()
-    messages.sort(key=lambda v:(v['create_time'],v['local_id'],v['source']['shard']),reverse=True)
-    complete=bool(states) and all(type(s.get('target')) is int and s.get('history_complete') and s['history']>=s['H'] and s['tail']>=s['target'] for s in states)
+    messages.sort(key=lambda v:(v['create_time'],v['local_id'],v['source']['shard'],v['source'].get('table_generation',0)),reverse=True)
+    current_complete=bool(states) and all(not s.get('initial_suffix_pending') and type(s.get('target')) is int and s.get('history_complete') and s['history']>=s['H'] and s['tail']>=s['target'] for s in states)
+    prior_unknown=any(s.get('prior_coverage_unknown') for s in states)
+    complete=current_complete and not prior_unknown
+    if prior_unknown:gaps.append('prior_history_coverage_unknown')
     if not complete:gaps.append('history_incomplete')
     query_scope_guard(config,token)
-    return dict(target_ref=request['target_ref'],selected_username=None,identity_status='unknown',messages=list(reversed(messages[offset:offset+limit])),coverage=dict(history_complete=complete,raw_table_complete=complete,identity_complete=False,atomic_global_snapshot=False,request_range=dict(status='unknown',reason='no_recent_range_observation')),gaps=sorted(set(gaps)),source_opens=0,freshness='local_snapshot',synced_at=min((s.get('checked_at',0) for s in states),default=None))
+    return dict(target_ref=request['target_ref'],selected_username=None,identity_status='unknown',messages=list(reversed(messages[offset:offset+limit])),coverage=dict(history_complete=complete,raw_table_complete=complete,current_H_complete=current_complete,prior_coverage_unknown=prior_unknown,identity_complete=False,atomic_global_snapshot=False,request_range=dict(status='unknown',reason='no_recent_range_observation')),gaps=sorted(set(gaps)),source_opens=0,freshness='stale' if paused else 'local_snapshot',synced_at=min((s.get('checked_at',0) for s in states),default=None))
 
 from .failure_evidence import _register
 _register(query_local,_query_table_ref)

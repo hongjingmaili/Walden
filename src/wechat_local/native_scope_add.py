@@ -40,15 +40,15 @@ def directory(path):
     finally:os.close(fd)
 
 
-def read(path):
+def read(path, *, limit=4*1024*1024):
     path=Path(path).absolute()
     with directory(path.parent) as parent:
         fd=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
         with os.fdopen(fd,'rb') as stream:
             info=os.fstat(stream.fileno())
             need(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and stat.S_IMODE(info.st_mode)==0o600
-                 and info.st_nlink==1 and info.st_size<=4*1024*1024,'scope_add_unsafe_file')
-            raw=stream.read(4*1024*1024+1)
+                 and info.st_nlink==1 and info.st_size<=limit,'scope_add_unsafe_file')
+            raw=stream.read(limit+1)
             need(identity(info)==identity(os.fstat(stream.fileno())) and len(raw)==info.st_size,'scope_add_file_changed')
         return raw,dict(sha256=sha(raw),stat=identity(info),parent=identity(os.fstat(parent),True))
 

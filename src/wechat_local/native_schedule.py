@@ -8,6 +8,7 @@ This does not make OS observation + removal atomic against external same-user re
 """
 from __future__ import annotations
 import fcntl
+import errno
 import hashlib
 import json
 import os
@@ -115,8 +116,23 @@ class LaunchctlTransport:
             raise OSError('service context mismatch')
         return target[len(prefix):]
 
+    def _read_job(self, target):
+        # Read-only retries, never submission/removal retries. Context and malformed
+        # identity failures remain immediate; no cached result supplies authority.
+        for attempt in range(3):
+            label = self._label(target)
+            try:
+                return self.api.get(label)
+            except OSError as error:
+                retryable = (isinstance(error, public_service.ServiceReadUnavailable)
+                             or type(error) in (OSError, InterruptedError, BlockingIOError, TimeoutError) and error.errno in
+                             (errno.EINTR, errno.EAGAIN, errno.ETIMEDOUT))
+                if not retryable or attempt == 2:
+                    raise
+                time.sleep(.05)  # At most 100 ms explicit wait per public read.
+
     def observe(self, target):
-        value = self.api.get(self._label(target))
+        value = self._read_job(target)
         if value is None:
             return dict(target=target, state='absent')
         if value.get('Label') != self._label(target) or type(value.get('ProgramArguments')) is not list or _argv_operation(value.get('ProgramArguments')) is None:
@@ -130,7 +146,7 @@ class LaunchctlTransport:
         self.api.remove(self._label(target), wait=wait)
 
     def pid(self, target):
-        value = self.api.get(self._label(target))
+        value = self._read_job(target)
         if value is None:return None
         pid = value.get('PID')
         if pid is None:return None
@@ -243,11 +259,27 @@ def _optional_submit_identity(run,target):
         return None,observation
 
 
-def configure(config, config_path, executable, service_dir, enabled, *, runner=None, duration_seconds=600, follow_grant=None, prepared=None):
+_PREPARATION_PHASES=frozenset(('configure_entry','service_context','service_lock','control_read','existing_control',
+    'preflight_os_read','control_write','pre_submit_recheck','prepared_callback','pre_submit_guard',
+    'submit_intent','os_submit','accepted_receipt','identity_observe','post_submit_guard','configured','existing_owned'))
+
+
+def _mark_preparation(trace, phase, *, attempted=None, returned=None):
+    # Private call-local facts, not persisted authority or an exception value.
+    if type(trace) is dict:
+        trace['phase']=phase
+        if attempted is not None:trace['submit_attempted']=attempted
+        if returned is not None:trace['submit_returned']=returned
+
+
+def configure(config, config_path, executable, service_dir, enabled, *, runner=None, duration_seconds=600, follow_grant=None, prepared=None, _terminal_retirement=None, _prepare_trace=None):
+    _mark_preparation(_prepare_trace,'configure_entry',attempted=False,returned=False)
     from .native_deadline import Deadline, continuous_ns
+    if _terminal_retirement is not None and enabled:_unknown()
     expected_config = _config_facts(config)
     requested_deadline = (Deadline(follow_grant['deadline']) if follow_grant is not None else Deadline.create(duration_seconds)) if enabled else None
     expected_interval = follow_grant['interval_seconds'] if follow_grant is not None else int(config.get('mirror_interval', 60))
+    _mark_preparation(_prepare_trace,'service_context')
     run = runner or LaunchctlTransport()
     config_path, executable, directory = (Path(p).absolute() for p in (config_path, executable, service_dir))
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -263,13 +295,16 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
     active = path.with_suffix('.active')
     runtime_path = path.with_suffix('.runtime')
     args = _follow_args([str(executable), 'bounded', '--source-config', str(config_path), '--operation-record', str(record_path)], follow_grant)
+    _mark_preparation(_prepare_trace,'service_lock')
     with _lock(directory):
+        _mark_preparation(_prepare_trace,'control_read')
         if _config_digest(config_path) != expected_config:
             _unknown()
         for item in (path, record_path, active, runtime_path,path.with_suffix('.starting'),path.with_suffix('.submission')):
             if item.is_symlink():
                 _unknown()
         if path.exists():
+            _mark_preparation(_prepare_trace,'existing_control')
             try:
                 data, identity = _read(path)
                 record_data, _ = _read(record_path)
@@ -279,7 +314,11 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                     _unknown()
                 if active.exists() and _read(active) != (b'unknown\n', record.get('active_identity')):
                     _unknown()
-                if (record.get('target') != target or record.get('os_context') != context or record.get('preflight') != 'absent'
+                record_context=context
+                if _terminal_retirement is not None:
+                    from .native_follow_terminal import verify_configure
+                    record_context=verify_configure(_terminal_retirement,config,config_path,executable,directory,follow_grant,record,run)
+                if (record.get('target') != target or record.get('os_context') != record_context or record.get('preflight') != 'absent'
                     or record.get('plist_identity') != identity or record.get('plist_sha256') != _digest(data)
                     or record.get('config_sha256') != expected_config
                     or payload.get('Label') != label or payload.get('ProgramArguments') != args + ['--operation-token', record.get('operation')]
@@ -290,7 +329,7 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                 raise MirrorError('schedule_state_unknown') from None
             recorded_deadline = Deadline(record.get('deadline'))
             runtime = json.loads(_read(runtime_path)[0]) if runtime_path.exists() else None
-            if runtime is not None and (type(runtime) is not dict or runtime.get('operation') != record['operation'] or runtime.get('os_context') != context):
+            if runtime is not None and (type(runtime) is not dict or runtime.get('operation') != record['operation'] or runtime.get('os_context') != record_context):
                 _unknown()
             state = _observe(run, target, payload)
             if _config_digest(config_path) != expected_config:
@@ -299,6 +338,7 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                 recorded_deadline.check()
                 if state != 'owned' or record.get('interval_seconds') != expected_interval:
                     _unknown()
+                _mark_preparation(_prepare_trace,'existing_owned')
                 return path
             if state not in ('owned', 'absent'):
                 _unknown()
@@ -316,7 +356,7 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                 _unknown()
             leader = runtime.get('leader') if runtime else None
             from .native_background import starting_leader
-            early=starting_leader(record_path,record,payload,context=context,process=process)
+            early=starting_leader(record_path,record,payload,context=record_context,process=process)
             submitted=_submission(record_path,record)
             receipt_leader=submitted.get('leader') if submitted else None
             for candidate in (early,receipt_leader):
@@ -324,6 +364,9 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                     if leader and not process.same_generation(candidate,leader):_unknown()
                     leader=candidate
             pid = run.pid(target) if state == 'owned' else None
+            if _terminal_retirement is not None:
+                verify_configure(_terminal_retirement,config,config_path,executable,directory,follow_grant,record,run)
+                if pid is not None:_unknown()
             if pid is not None:
                 observed_leader = process.identity(pid)
                 if (not observed_leader or observed_leader['uid'] != os.getuid() or observed_leader['pid'] != observed_leader['pgid']
@@ -358,6 +401,8 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
             if _read(path) != (data, identity) or _read(record_path)[0] != record_data:
                 _unknown()
             check_active()
+            if _terminal_retirement is not None:
+                verify_configure(_terminal_retirement,config,config_path,executable,directory,follow_grant,record,run)
             suffix = '.disabled-' + str(time.time_ns())
             for item in (path, record_path, active, runtime_path,path.with_suffix('.starting'),path.with_suffix('.submission')):
                 if item.exists():
@@ -368,6 +413,7 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
             return path
         if any(item.exists() for item in (record_path,active,runtime_path,path.with_suffix('.starting'),path.with_suffix('.submission'))):
             _unknown()
+        _mark_preparation(_prepare_trace,'preflight_os_read')
         if _observe(run, target) != 'absent' or _config_digest(config_path) != expected_config:
             _unknown()
         if not enabled:
@@ -383,6 +429,7 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
                        ExitTimeOut=2, AbandonProcessGroup=False, EnvironmentVariables=environment)
         data = plistlib.dumps(payload)
         config_hash = expected_config
+        _mark_preparation(_prepare_trace,'control_write')
         _create(path, data)
         _, identity = _read(path)
         _create(active, b'unknown\n')
@@ -394,25 +441,34 @@ def configure(config, config_path, executable, service_dir, enabled, *, runner=N
         _create(record_path, json.dumps(record, sort_keys=True).encode())
         _submission(record_path,record,status='not_submitted')
         _sync_dir(directory)
+        _mark_preparation(_prepare_trace,'pre_submit_recheck')
         if _observe(run, target) != 'absent' or _config_digest(config_path) != expected_config or _read(path) != (data, identity):
             _unknown()
         if prepared is not None:
+            _mark_preparation(_prepare_trace,'prepared_callback')
             prepared(dict(operation=operation,record=str(record_path),grant=json.loads(json.dumps(follow_grant)),os_context=dict(context)))
+        _mark_preparation(_prepare_trace,'pre_submit_guard')
         requested_deadline.check()
+        _mark_preparation(_prepare_trace,'submit_intent')
         _submission(record_path,record,status='pending')
         try:
+            _mark_preparation(_prepare_trace,'os_submit',attempted=True)
             run.submit(payload)
+            _mark_preparation(_prepare_trace,'accepted_receipt',returned=True)
             # Successful submit is committed before any optional SM/libproc read.
             _submission(record_path,record,status='accepted',observation=dict(state='not_sampled',provider='sm_pid_and_libproc_identity_v1',public_job_pid=None))
+            _mark_preparation(_prepare_trace,'identity_observe')
             receipt_leader,observation=_optional_submit_identity(run,target)
             _submission(record_path,record,status='accepted',leader=receipt_leader,observation=observation)
         except (OSError, subprocess.SubprocessError) as error:
             if isinstance(error, subprocess.CalledProcessError):
                 child_result(error.returncode, error.stderr)
             raise MirrorError('schedule_state_unknown') from None
+        _mark_preparation(_prepare_trace,'post_submit_guard')
         if _observe(run, target, payload) != 'owned' or _config_digest(config_path) != expected_config:
             _unknown()
         # active is advisory only; ownership always comes from record + live OS.
+        _mark_preparation(_prepare_trace,'configured')
         return path
 
 
@@ -755,7 +811,8 @@ def inspect_status(config, config_path, executable, service_dir, *, runner=None,
     result = dict(state='unknown', registration='unknown', sync_health='unknown',
                   first_sync_completed=False, last_completed_attempt=None, last_completed_exit_code=None,
                   group_drained=None, writer_lock='unknown', stop_confirmed=False,
-                  runtime_self_report=None, record_source='none', gaps=['schedule_state_unknown'])
+                  runtime_self_report=None, record_source='none', gaps=['schedule_state_unknown'],
+                  observation_reason='guard_or_read_unknown',observation_stage='guards')
     try:
         if _scope_recovery is not None and (_terminal_only is not True or _scope_probe is not None or _maintenance is not None):_unknown()
         if _scope_probe is not None and (_terminal_only is not True or _maintenance is not None):_unknown()
@@ -902,11 +959,78 @@ def inspect_status(config, config_path, executable, service_dir, *, runner=None,
                 group_drained=runtime.get('group_drained') if type(runtime.get('group_drained')) is bool else None)
         # Revalidate observations and files. This is a bounded snapshot, not a
         # promise about future intervals and never an OS mutation or self-report.
-        if (_observe(run, target, payload) != observation or _config_digest(config_path) != expected
-                or _read(path) != (data, identity) or _read(record_path)[0] != raw
-                or (runtime_bytes is not None and _read(runtime_path)[0] != runtime_bytes)
-                or _slot_view(active_path, archives=not selected_active) != selected_slot):
+        def check_runtime_snapshot(stage):
+            result['observation_stage']=stage
+            latest_bytes=_read(runtime_path)[0] if runtime_bytes is not None else None
+            latest_slot=_slot_view(active_path,archives=not selected_active)
+            same_slot=(selected_slot==latest_slot or selected_active and
+                selected_slot[0]==latest_slot[0] and selected_slot[2]==latest_slot[2]
+                and selected_slot[1][:2]==latest_slot[1][:2] and selected_slot[1][3:]==latest_slot[1][3:])
+            if not same_slot:
+                result['observation_reason']='slot_changed';_unknown()
+            replaced=selected_slot[1][2]!=latest_slot[1][2]
+            if latest_bytes==runtime_bytes and not replaced:return
+            result['runtime_file_replaced']=replaced
+            result['status_before']=runtime.get('status') if runtime and runtime.get('status') in ('running','stopping','forcing_group_exit','stopped','stop_unconfirmed','cleanup_pending') else 'unknown'
+            if runtime_bytes is None:
+                result['observation_reason']='runtime_unpublished_change';_unknown()
+            latest=json.loads(latest_bytes)
+            result['status_after']=latest.get('status') if type(latest) is dict and latest.get('status') in ('running','stopping','forcing_group_exit','stopped','stop_unconfirmed','cleanup_pending') else 'unknown'
+            result['observation_attempt']=runtime.get('attempts',0)
+            mutable={'attempts','attempt_record','child_pid','child_exit','child_error_id',
+                     'last_completed','source_schedule','consumed_hint_generation',
+                     'media_child_pid','media_child_exit','media_attempts','media_error',
+                     'media_failed_exits','media_failure_seen','media_segment_plan',
+                     'media_segment_yield','media_segment_deferred'}
+            from .native_follow_schedule import partial_completion
+            def ordinary_round(value):
+                if type(value) is not dict or value.get('admission_failure'):return False
+                done=value.get('last_completed');code=value.get('child_exit')
+                mode=(value.get('source_schedule') or {}).get('mode')
+                if mode not in (None,'normal','idle'):return False
+                if done is None:return code is None
+                if (type(done) is not dict or done.get('operation')!=value.get('operation')
+                        or type(done.get('attempt')) is not int or not 1<=done['attempt']<=value['attempts']):return False
+                if partial_completion(done):
+                    return mode=='normal' and (code is None or type(code) is int and code==1)
+                return (type(done.get('exit_code')) is int and done['exit_code']==0
+                        and done.get('failure_reason') is None and done.get('failure_class') is None
+                        and not done.get('source_conflicts') and (code is None or type(code) is int and code==0))
+            authority_same=(type(latest) is dict and all(runtime.get(key)==latest.get(key)
+                for key in set(runtime)|set(latest) if key not in mutable))
+            result['observation_reason']='runtime_nonordinary_change' if authority_same else 'runtime_authority_change'
+            ordinary=(observation=='owned' and not expired and authority_same
+                    and runtime.get('status')==latest.get('status')=='running'
+                    and type(latest.get('attempts')) is int and runtime['attempts']<=latest['attempts']<=runtime['attempts']+1
+                    and ordinary_round(runtime) and ordinary_round(latest))
+            lifecycle={'status','stop_reason','registration_absent','group_drained','cleanup_observation','cleanup_pending'}
+            cleanup=False
+            if type(latest) is dict and Deadline(record['deadline']).remaining()<=0:
+                cleanup=(latest.get('stop_reason')=='deadline'
+                    and runtime.get('status') in ('running','stopping','cleanup_pending','stopped','stop_unconfirmed')
+                    and latest.get('status') in ('stopping','cleanup_pending','stopped','stop_unconfirmed')
+                    and all(runtime.get(key)==latest.get(key) for key in set(runtime)|set(latest) if key not in mutable|lifecycle)
+                    and type(latest.get('attempts')) is int and latest['attempts']==runtime['attempts']
+                    and ordinary_round(runtime) and ordinary_round(latest)
+                    and all(value.get('child_exit')==0 and type(value.get('child_exit')) is int
+                        and (value.get('last_completed') or {}).get('exit_code')==0
+                        and value['attempts']==value['last_completed']['attempt'] for value in (runtime,latest)))
+                if cleanup and latest.get('cleanup_pending') is not None:
+                    from .native_background import cleanup_handoff_status
+                    cleanup=cleanup_handoff_status(latest,record,record_context).get('state')=='pending'
+            if ordinary or cleanup:
+                result.update(runtime_snapshot_changed=True,
+                              observation_reason='runtime_ordinary_change' if ordinary else 'runtime_cleanup_change')
             _unknown()
+        if _observe(run,target,payload)!=observation:
+            result['observation_reason']='registration_changed';_unknown()
+        if _config_digest(config_path)!=expected:
+            result['observation_reason']='configuration_changed';_unknown()
+        if _read(path)!=(data,identity):
+            result['observation_reason']='plist_changed';_unknown()
+        if _read(record_path)[0]!=raw:
+            result['observation_reason']='record_changed';_unknown()
+        check_runtime_snapshot('final')
         stopped = observation == 'absent' and result['group_drained'] is True and result['writer_lock'] == 'free'
         if retired_delta and not stopped and not (_maintenance is not None and observation=='absent' and result['group_drained'] is True and result['writer_lock']=='busy'):_unknown()
         if _terminal_only and _maintenance is not None:result.update(maintenance_terminal=True,actual_grant_kind=retired_grant['kind'],authority_receipt_sha256=_maintenance.receipt_sha256)
@@ -925,8 +1049,9 @@ def inspect_status(config, config_path, executable, service_dir, *, runner=None,
                 result['cleanup_handoff']=handoff
                 result['gaps']+=handoff['gaps']
                 if handoff['state'] not in ('confirmed','confirmed_after_expiry'):result['sync_health']='unknown'
-                if (_observe(run,target,payload)!=observation or _read(runtime_path)[0]!=runtime_bytes
-                    or _slot_view(active_path,archives=not selected_active)!=selected_slot):_unknown()
+                if _observe(run,target,payload)!=observation:
+                    result['observation_reason']='registration_changed';_unknown()
+                check_runtime_snapshot('handoff')
         if observation == 'absent' and not stopped:
             result.update(state='unknown', gaps=['schedule_stop_unconfirmed'])
         if _scope_probe is not None:
@@ -935,6 +1060,7 @@ def inspect_status(config, config_path, executable, service_dir, *, runner=None,
         if _scope_recovery is not None:
             _scope_recovery_terminal_grant(_scope_recovery,retired_grant,follow_grant,record,payload,config,config_path,_probe_context(run),run)
             if not stopped:_unknown()
+        result['observation_reason']='stable'
         return result
     except (OSError, MirrorError, ValueError, TypeError, KeyError, AttributeError, ExpatError, subprocess.SubprocessError):
         # A partially observed old completion never survives failed ownership or
@@ -945,4 +1071,4 @@ def inspect_status(config, config_path, executable, service_dir, *, runner=None,
         return result
 
 
-_register(_unknown, _read, _digest, _config_facts, _config_digest, _create, _sync_dir, _argv_operation, _observe, _schedule_label, _follow_args, _submission, _optional_submit_identity, configure, _writer_state, _slot_view, _retired_context_delta, inspect_terminal_status, inspect_status)
+_register(_mark_preparation, _unknown, _read, _digest, _config_facts, _config_digest, _create, _sync_dir, _argv_operation, _observe, _schedule_label, _follow_args, _submission, _optional_submit_identity, configure, _writer_state, _slot_view, _retired_context_delta, inspect_terminal_status, inspect_status)
