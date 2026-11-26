@@ -234,3 +234,46 @@ def test_recovery_requires_exact_sealed_canonical_new_inode(item):
     path.rename(preserved);shutil.copyfile(preserved,path);path.chmod(0o600)
     with pytest.raises(MirrorError,match='registry_migration_publication_unknown'):convert(item)
     assert (root/migration.PENDING).exists() and preserved.exists()
+
+
+def test_read_budget_window_relaxed_and_enforces_time_bytes_and_deadline(item, monkeypatch):
+    from wechat_local.native_deadline import Deadline, _current
+
+    config, _, _ = item
+    convert(item)
+    assert reuse.READ_SECONDS >= 10.0
+
+    clock = [1000.0]
+    monkeypatch.setattr(reuse.time, 'monotonic', lambda: clock[0])
+
+    with sc.registry(config) as db:
+        budget = reuse._reading.get()
+        assert budget.until == pytest.approx(1000.0 + reuse.READ_SECONDS)
+
+        # Exceeding old 2s cap (e.g. 3.5s scan under concurrent sync) succeeds.
+        clock[0] = 1003.5
+        assert sc.member(config, db, 'message_0.db', TABLE)['supported'] is True
+
+        # Active tighter deadline is still enforced via check_deadline().
+        expired_deadline = Deadline(
+            dict(wall_until=100.0, continuous_start=1, continuous_until=2_000_000_000),
+            wall=lambda: 200.0,
+            continuous=lambda: 3_000_000_000,
+        )
+        token = _current.set(expired_deadline)
+        try:
+            with pytest.raises(MirrorError, match='schedule_deadline_expired'):
+                budget.check()
+        finally:
+            _current.reset(token)
+
+        # Exceeding relaxed READ_SECONDS still raises registry_reuse_read_budget.
+        clock[0] = 1000.0 + reuse.READ_SECONDS + 0.1
+        with pytest.raises(MirrorError, match='registry_reuse_read_budget'):
+            sc.member(config, db, 'message_0.db', TABLE)
+
+        # Byte cap (16 MiB) still enforced even when within time budget.
+        clock[0] = 1001.0
+        budget.bytes = 16 * 1024 * 1024
+        with pytest.raises(MirrorError, match='registry_reuse_read_budget'):
+            budget.take(1)

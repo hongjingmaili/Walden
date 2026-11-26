@@ -33,6 +33,8 @@ def pending(registry, shard, table):
                 or type(value.get('blocked')) is not bool or type(value.get('epoch')) is not int
                 or not 0 <= value['epoch'] <= 127 or type(value.get('target')) is not int or value['target'] < 0
                 or value.get('phase') not in (None, 'verify', 'restore')
+                or (value.get('anchored') is not None and type(value['anchored']) is not bool)
+                or (value.get('missing') is not None and type(value['missing']) is not bool)
                 or (value.get('through') is not None
                     and (type(value['through']) is not int or value['through'] < value['after']))
                 or (value.get('stamp') is not None
@@ -109,6 +111,16 @@ def generations(conn, table, progress):
 
 def _typed_equal(left, right):
     return all(type(a) is type(b) and a == b for a, b in zip(left, right)) and len(left) == len(right)
+
+
+def _same_positive_server(columns, old, row):
+    if old is None or row is None or 'server_id' not in columns:
+        return False
+    index = 1 + columns.index('server_id')
+    old_server, new_server = old[index], row[index]
+    return (type(old_server) is int and old_server > 0
+            and type(new_server) is int and new_server > 0
+            and old_server == new_server)
 
 
 def _is_reused(local, table, epoch, columns, old, row):
@@ -240,6 +252,8 @@ def _tail_reuse(local, source, name, table, columns, read_source, until, budget,
     select = 'SELECT ' + fields + ' FROM '
     old = local.execute(select + qi(name) + ' ORDER BY local_id')
     ambiguous = False
+    anchored = False
+    missing = False
     try:
         while True:
             check_deadline()
@@ -247,7 +261,7 @@ def _tail_reuse(local, source, name, table, columns, read_source, until, budget,
                 raise Paused(PENDING)
             page = old.fetchmany(256)
             if not page:
-                if ambiguous:
+                if ambiguous or (missing and not anchored):
                     raise Paused(PENDING)
                 return None
             ids = tuple(ident for ident, _ in page)
@@ -256,7 +270,7 @@ def _tail_reuse(local, source, name, table, columns, read_source, until, budget,
             uncertain = []
             for ident, prior_server in page:
                 if ident not in observed:
-                    ambiguous = True
+                    missing = True
                     continue
                 server = observed[ident]
                 known = type(prior_server) is int and prior_server > 0 and type(server) is int and server > 0
@@ -264,7 +278,9 @@ def _tail_reuse(local, source, name, table, columns, read_source, until, budget,
                     with lossless_text_rows(local):
                         original = local.execute('SELECT rowid,* FROM ' + qi(name) + ' WHERE local_id=?', (ident,)).fetchone()
                     return ident, original
-                if not known:
+                if known:
+                    anchored = True
+                else:
                     if type(server) is not type(prior_server) or server != prior_server:
                         ambiguous = True
                     else:
@@ -283,6 +299,7 @@ def write(source, path, store, key, table, columns, rows, prior, progress, maxim
         return store.apply_batch(key, table, rows, progress, **({'_commit_check': guard} if guard else {})), None
     name = physical(table, prior.get('cursor_epoch', 0))
     commit = lambda: _validated_commit(source, path, prior, guard)
+    batch_rows = list(rows)
     def before_rows(local):
         raw = _begin(local, store, table, prior)
         epoch = prior.get('cursor_epoch', 0)
@@ -300,18 +317,22 @@ def write(source, path, store, key, table, columns, rows, prior, progress, maxim
                     raise Paused(PENDING)
                 return _rotate(local, store, key, table, raw, prior, renewed, maximum, commit, promote)
             checked.add((table,epoch))
+        kept = []
         for row in rows:
             with lossless_text_rows(local):
                 old = local.execute('SELECT rowid,* FROM ' + qi(name) + ' WHERE rowid=?', (row[0],)).fetchone()
             if old is not None and not _typed_equal(old, row):
-                if _is_reused(local, table, prior.get('cursor_epoch', 0), columns, old, row):
+                if _is_reused(local, table, epoch, columns, old, row):
                     return _rotate(local, store, key, table, raw, prior, row, maximum, commit, promote)
-                # An ordinary revision with the same meaningful server ID
-                # keeps its existing behavior, except during/after recovery.
-                i = 1 + columns.index('server_id') if 'server_id' in columns else 0
-                if prior.get('cursor_guarded') or not i or type(old[i]) is not int or old[i] <= 0 or type(row[i]) is not int or row[i] != old[i]:
+                if not _same_positive_server(columns, old, row):
                     raise Paused(PENDING)
-    outcome=store.apply_batch(key, table, rows, progress, _physical=name, _before_rows=before_rows, _commit_check=commit)
+                # After cursor recovery, preserve already-synced old rows
+                # without re-pausing on legitimate same-server_id revisions.
+                if prior.get('cursor_guarded'):
+                    continue
+            kept.append(row)
+        batch_rows[:] = kept
+    outcome=store.apply_batch(key, table, batch_rows, progress, _physical=name, _before_rows=before_rows, _commit_check=commit)
     return (0, outcome) if isinstance(outcome, dict) else (outcome, None)
 
 
@@ -328,9 +349,13 @@ def recover(source, path, store, key, table, columns, prior, maximum, state, bud
     blocked = state['blocked']
     can_restore = maximum >= ceiling
     phase = state.get('phase', 'verify')
-    if state.get('stamp') != snapshot or through is None or maximum != through:
-        after, through, blocked, phase = 0, maximum, False, 'verify'
-    name = physical(table, prior.get('cursor_epoch', 0))
+    anchored = bool(state.get('anchored', False))
+    missing = bool(state.get('missing', False))
+    if (state.get('stamp') != snapshot or through is None or maximum != through
+            or (phase == 'verify' and after > 0
+                and (state.get('anchored') is None or state.get('missing') is None))):
+        after, through, blocked, phase, anchored, missing = 0, maximum, False, 'verify', False, False
+    name = physical(table, epoch)
     count = min(500, batch_size, budget['rows'] - budget['used_rows'])
     if count <= 0:
         return None, state
@@ -369,16 +394,27 @@ def recover(source, path, store, key, table, columns, prior, maximum, state, bud
         for ident, old in old_rows.items():
             check_deadline()
             row = new_rows.get(ident)
-            if row is None or not _typed_equal(old, row):
-                if _is_reused(local, table, prior.get('cursor_epoch', 0), columns, old, row):
-                    return _rotate(local, store, key, table, raw, prior, row, maximum, commit, promote), None
+            if row is None:
+                missing = True
+                continue
+            same_server = _same_positive_server(columns, old, row)
+            if _typed_equal(old, row):
+                if same_server:
+                    anchored = True
+                continue
+            if _is_reused(local, table, epoch, columns, old, row):
+                return _rotate(local, store, key, table, raw, prior, row, maximum, commit, promote), None
+            if same_server:
+                anchored = True
+            else:
                 blocked = True
         finished = not ids or (len(selected) == len(ids) and max(len(old_sizes), len(new_sizes)) < count) or end == through
+        unanchored_delete = finished and missing and not anchored
         # A full proof must precede inserts. A small table can prove and
         # restore its complete span in this exact transaction. For a larger
         # table, retain only the verified keyset position while the Source
         # commit files have the same stamp. Changes restart that evidence.
-        if can_restore and not blocked and (phase == 'restore' or finished and not after):
+        if can_restore and not blocked and not unanchored_delete and (phase == 'restore' or finished and not after):
             if finished:
                 progress = dict(prior, cursor_guarded=True, tail=max(prior['tail'], through),
                                 target=maximum, checked_at=now, account_recent=None, account_recent_pending=True)
@@ -390,16 +426,22 @@ def recover(source, path, store, key, table, columns, prior, maximum, state, bud
             new_only = [row for row in rows if row[0] not in old_rows]
             written = store.apply_batch(key, table, new_only, progress, _connection=local,
                                         _physical=name, _commit_check=commit, _keep_progress=not finished)
-            remaining = None if finished else dict(after=end, through=through, blocked=False, phase='restore', stamp=snapshot, target=ceiling, epoch=epoch)
+            remaining = None if finished else dict(
+                after=end, through=through, blocked=False, anchored=anchored, missing=missing,
+                phase='restore', stamp=snapshot, target=ceiling, epoch=epoch)
             return _entry(progress, len(rows), written, 'cursor_recovery'), remaining
         # No writes for an unproven identity. Once all overlap is verified
         # under one Source commit stamp, replay missing IDs from the start.
         commit()
         if finished:
-            if can_restore and not blocked:
-                return None, dict(after=0, through=through, blocked=False, phase='restore', stamp=snapshot, target=ceiling, epoch=epoch)
+            if can_restore and not blocked and not unanchored_delete:
+                return None, dict(
+                    after=0, through=through, blocked=False, anchored=anchored, missing=missing,
+                    phase='restore', stamp=snapshot, target=ceiling, epoch=epoch)
             return None, dict(after=0, through=None, blocked=False, target=ceiling, epoch=epoch)
-        return None, dict(after=end, through=through, blocked=blocked, phase='verify', stamp=snapshot, target=ceiling, epoch=epoch)
+        return None, dict(
+            after=end, through=through, blocked=blocked, anchored=anchored, missing=missing,
+            phase='verify', stamp=snapshot, target=ceiling, epoch=epoch)
 
 
 def observed_rows(conn, local_id):

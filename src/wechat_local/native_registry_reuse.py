@@ -38,8 +38,10 @@ def _connections():
 def _connection_id(conn):return id(getattr(conn,'raw',conn))
 def forget(conn):_connections().pop(_connection_id(conn),None)
 
+READ_SECONDS=15.
+
 class _Read:
-    def __init__(self):self.bytes=0;self.until=time.monotonic()+2.
+    def __init__(self):self.bytes=0;self.until=time.monotonic()+READ_SECONDS
     def check(self):
         from .native_deadline import check_deadline
         check_deadline()

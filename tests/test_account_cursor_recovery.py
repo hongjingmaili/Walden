@@ -92,15 +92,19 @@ def test_reused_integer_identity_keeps_old_rows_and_merges_query(item, monkeypat
     assert set(before[1]) <= set(observations)
 
 
-def test_raised_max_with_changed_old_body_holds_and_never_overwrites(item, monkeypatch):
+def test_raised_max_with_changed_old_body_and_nonpositive_server_id_holds_and_never_overwrites(item, monkeypatch):
     seed(item)
     hinted_round(item, monkeypatch)
+    config = item['config']
+    key = SourceKey(config['account_id'], config['source_generation'], SHARD, FIRST)
+    store = MirrorStore(item['local_path'], key)
+    store.apply_batch(key, FIRST, [(3, *row(3, 0))], store.progress(FIRST))
     with sqlite3.connect(item['source_db']) as source:
         source.execute(f'DELETE FROM {FIRST} WHERE local_id=3')
     hinted_round(item, monkeypatch, shards={SHARD: 2})
     before = preserved(item)
     with sqlite3.connect(item['source_db']) as source:
-        different = list(row(3))
+        different = list(row(3, 0))
         different[5] = 'same identifier with changed content'
         source.executemany(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', [different, row(4)])
     result = hinted_round(item, monkeypatch, shards={SHARD: 3})
@@ -297,15 +301,15 @@ def test_table_partial_keeps_normal_cadence_with_or_without_shard_retry():
         assert state['observed_catchup_complete'] is None
 
 
-@pytest.mark.parametrize('missing', [False, True])
-def test_high_max_with_ambiguous_old_ids_cannot_add_rows_to_original(item, monkeypatch, missing):
+@pytest.mark.parametrize('mode', ['zero_server_id', 'delete_all'])
+def test_high_max_with_ambiguous_old_ids_cannot_add_rows_to_original(item, monkeypatch, mode):
     seed(item)
     hinted_round(item, monkeypatch)
     before = preserved(item)
 
     with sqlite3.connect(item['source_db']) as source:
-        if missing:
-            source.execute(f'DELETE FROM {FIRST} WHERE local_id=3')
+        if mode == 'delete_all':
+            source.execute(f'DELETE FROM {FIRST}')
         else:
             source.execute(f'UPDATE {FIRST} SET server_id=0 WHERE local_id=2')
         source.execute(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', row(4))
@@ -336,3 +340,146 @@ def test_identical_typed_row_with_unknown_server_id_allows_same_generation_tail(
     assert result['gaps'] == []
     assert [m['local_id'] for m in messages(item, FIRST)] == [1, 2, 3, 4]
     assert 'cursor_epoch' not in store.progress(FIRST)
+
+
+def test_middle_delete_with_positive_anchor_passes_tail_reuse_and_preserves_old_rows(item, monkeypatch):
+    seed(item)
+    hinted_round(item, monkeypatch)
+    before = preserved(item)
+
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'DELETE FROM {FIRST} WHERE local_id=2')
+        source.execute(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', row(4))
+
+    result = hinted_round(item, monkeypatch, shards={SHARD: 2})
+    assert result['gaps'] == []
+    rows, observed, progress = preserved(item)
+    assert rows[:3] == before[0]
+    assert set(before[1]) <= set(observed)
+    assert [m['local_id'] for m in messages(item, FIRST)] == [1, 2, 3, 4]
+    assert 'cursor_epoch' not in json.loads(progress)
+
+
+@pytest.mark.parametrize('multipage', [False, True])
+def test_pending_table_recovers_with_middle_delete_same_server_revision_and_unlocks_media(item, monkeypatch, multipage):
+    seed(item)
+    # Replace row 1 with an image message (local_type=3) to verify media gating clears on recovery.
+    img_row = (1, 10, 3, 1001, 0, '<msg><img md5="abc"/></msg>', 0)
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'UPDATE {FIRST} SET local_type=?, message_content=? WHERE local_id=1', (img_row[2], img_row[5]))
+    config = item['config']
+    key = SourceKey(config['account_id'], config['source_generation'], SHARD, FIRST)
+    store = MirrorStore(item['local_path'], key)
+    store.apply_batch(key, FIRST, [(1, *img_row)], store.progress(FIRST))
+    hinted_round(item, monkeypatch)
+
+    # Enter source_table_cursor_pending via tail regression.
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'DELETE FROM {FIRST} WHERE local_id=3')
+    paused_result = hinted_round(item, monkeypatch, shards={SHARD: 2})
+    assert 'source_table_cursor_pending' in paused_result['gaps']
+    paused_query = query_local(config, {'target_ref': target(item, FIRST), 'images': True})
+    assert paused_query['messages'][0]['media']['reason'] == 'cursor_generation_media_unavailable'
+    before = preserved(item)
+
+    # Now source deletes middle row 2, revises row 3 with SAME positive server_id=30, and adds row 4.
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'DELETE FROM {FIRST} WHERE local_id=2')
+        revised = list(row(3, 30))
+        revised[5] = 'recalled or revised same server_id'
+        source.executemany(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', [revised, row(4)])
+
+    if multipage:
+        from wechat_local import native_mirror_sync as sync
+        normal_budget = sync._account_budget
+        def bounded(cfg):
+            res = normal_budget(cfg)
+            res['rows'] = 2
+            return res
+        monkeypatch.setattr(sync, '_account_budget', bounded)
+
+    for hint in range(3, 10):
+        result = hinted_round(item, monkeypatch, shards={SHARD: hint})
+        if not result['gaps']:
+            break
+    assert result['gaps'] == []
+    rows, observed, progress = preserved(item)
+    # Old rows 1, 2 (deleted in source), and 3 (revised in source) are strictly preserved unchanged.
+    assert rows[:3] == before[0]
+    assert set(before[1]) <= set(observed)
+    assert [m['local_id'] for m in messages(item, FIRST)] == [1, 2, 3, 4]
+    assert json.loads(progress)['cursor_guarded'] is True
+
+    # Media is unlocked (no longer cursor_generation_media_unavailable).
+    recovered_query = query_local(config, {'target_ref': target(item, FIRST), 'images': True})
+    assert 'source_table_cursor_pending' not in recovered_query['gaps']
+    assert recovered_query['messages'][0]['media']['reason'] != 'cursor_generation_media_unavailable'
+
+    # Subsequent round (account_recent recheck on cursor_guarded table) must NOT re-pause or overwrite row 3.
+    followup = hinted_round(item, monkeypatch, shards={SHARD: 10})
+    assert followup['gaps'] == []
+    assert preserved(item)[0][:3] == before[0]
+
+
+def test_middle_delete_combined_with_true_local_id_reuse_still_rotates(item, monkeypatch):
+    seed(item)
+    hinted_round(item, monkeypatch)
+    before = preserved(item)
+
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'DELETE FROM {FIRST} WHERE local_id=1')
+        source.execute(f'UPDATE {FIRST} SET server_id=812, message_content=? WHERE local_id=2', ('reused with delete',))
+        source.execute(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', row(4))
+
+    result = hinted_round(item, monkeypatch, shards={SHARD: 2})
+    assert result['gaps'] == []
+    assert preserved(item)[:2] == before[:2]
+    for hint in range(3, 7):
+        hinted_round(item, monkeypatch, shards={SHARD: hint})
+    observed = {(m['text'], m['source'].get('table_generation')) for m in messages(item, FIRST)}
+    assert ('message 1', 0) in observed
+    assert ('message 2', 0) in observed
+    assert ('reused with delete', 1) in observed
+    assert ('message 4', 1) in observed
+
+
+def test_delete_without_any_positive_server_id_anchor_fails_closed(item, monkeypatch):
+    seed(item)
+    hinted_round(item, monkeypatch)
+    config = item['config']
+    key = SourceKey(config['account_id'], config['source_generation'], SHARD, FIRST)
+    store = MirrorStore(item['local_path'], key)
+    store.apply_batch(key, FIRST, [(n, *row(n, 0)) for n in (1, 2, 3)], store.progress(FIRST))
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'UPDATE {FIRST} SET server_id=0')
+    before = preserved(item)
+
+    with sqlite3.connect(item['source_db']) as source:
+        source.execute(f'DELETE FROM {FIRST} WHERE local_id=2')
+        source.execute(f'INSERT INTO {FIRST} VALUES (?,?,?,?,?,?,?)', row(4))
+
+    for hint in range(2, 5):
+        result = hinted_round(item, monkeypatch, shards={SHARD: hint})
+        assert result['gaps'] == ['source_table_cursor_pending']
+        assert preserved(item) == before
+
+
+def test_pending_state_validation_accepts_legacy_and_bool_rejects_malformed(item):
+    from wechat_local import native_table_cursor as tc
+    from wechat_local.native_mirror_store import MirrorError
+
+    seed(item)
+    with sc.registry(item['config'], write=True) as registry:
+        legacy = dict(after=0, through=None, blocked=False, target=3, epoch=0)
+        tc.set_pending(registry, SHARD, FIRST, legacy)
+        assert tc.pending(registry, SHARD, FIRST) == legacy
+
+        extended = dict(after=1, through=5, blocked=False, anchored=True, missing=True,
+                        phase='verify', stamp='a' * 64, target=3, epoch=0)
+        tc.set_pending(registry, SHARD, FIRST, extended)
+        assert tc.pending(registry, SHARD, FIRST) == extended
+
+        for bad in (dict(extended, anchored=1), dict(extended, missing='yes')):
+            tc.set_pending(registry, SHARD, FIRST, bad)
+            with pytest.raises(MirrorError, match='scope_copy_proof'):
+                tc.pending(registry, SHARD, FIRST)
